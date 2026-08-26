@@ -1,0 +1,20 @@
+{
+  "name": "smartfinance-tontine-payments",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Petit serveur qui detient la cle secrete CinetPay et le webhook de paiement pour les tontines SmartFinance. Ne fait jamais partie de l'app Flutter - deploye separement (ex. Render, gratuit).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.7.0"
+  }
+}
