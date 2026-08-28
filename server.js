@@ -115,6 +115,19 @@ function sanitizeForTransactionId(value) {
   return String(value).replace(/[^a-zA-Z0-9]/g, '').slice(0, 20);
 }
 
+// Log le detail complet d'une erreur axios (statut + corps de reponse) —
+// `err.response?.data || err.message` seul affichait juste "Request failed
+// with status code 406" quand E-Billing renvoie un corps vide, sans dire
+// pourquoi (mauvais format de numero, operateur incorrect, etc.).
+function logAxiosError(label, err) {
+  console.error(
+    label,
+    'status=', err.response?.status,
+    'data=', JSON.stringify(err.response?.data),
+    'message=', err.message
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Authentification OAuth2 (Cognito, client-credentials) — un jeton est
 // mis en cache en memoire et reutilise jusqu'a ~1 minute avant son
@@ -269,10 +282,15 @@ app.post('/api/tontine/init-payment', requireAuth, async (req, res) => {
 
     res.json({ transactionId: externalReference, ussdPushId: String(ussdPush.id) });
   } catch (err) {
-    console.error('init-payment error:', err.response?.data || err.message);
+    logAxiosError('init-payment error:', err);
     if (err.response?.status === 406) {
+      const detail = err.response.data || {};
       return res.status(406).json({
-        error: err.response.data?.message || "Le prestataire de paiement a refuse l'operation.",
+        error:
+          detail.message ||
+          detail.operator_response ||
+          "Le prestataire de paiement a refuse l'operation. Verifie le format du numero " +
+            "(indicatif pays sans '+' ni '0' initial, ex: 24177xxxxxxx) et que l'operateur choisi correspond au numero.",
       });
     }
     res.status(500).json({ error: "Erreur serveur lors de l'initialisation du paiement." });
@@ -341,7 +359,7 @@ app.post('/api/tontine/ebilling/notify', async (req, res) => {
     await pendingRef.delete();
     res.sendStatus(200);
   } catch (err) {
-    console.error('notify error:', err.response?.data || err.message);
+    logAxiosError('notify error:', err);
     // On repond 200 quand meme pour eviter une boucle de re-livraison sur
     // une erreur de notre cote qui ne se resoudra pas toute seule ; l'echec
     // est trace dans les logs pour investigation manuelle.
@@ -360,7 +378,7 @@ app.post('/api/tontine/ebilling/notify', async (req, res) => {
 //    multi-devises est une decision produit a part entiere, pas traitee ici.
 // ---------------------------------------------------------------------------
 const PREMIUM_PLANS = {
-  mensuel: { amount: 3000, days: 30 },
+  mensuel: { amount: 3500, days: 30 },
   annuel: { amount: 35000, days: 365 },
 };
 
@@ -396,10 +414,15 @@ app.post('/api/premium/init-payment', requireAuth, async (req, res) => {
 
     res.json({ transactionId: externalReference, ussdPushId: String(ussdPush.id) });
   } catch (err) {
-    console.error('premium init-payment error:', err.response?.data || err.message);
+    logAxiosError('premium init-payment error:', err);
     if (err.response?.status === 406) {
+      const detail = err.response.data || {};
       return res.status(406).json({
-        error: err.response.data?.message || "Le prestataire de paiement a refuse l'operation.",
+        error:
+          detail.message ||
+          detail.operator_response ||
+          "Le prestataire de paiement a refuse l'operation. Verifie le format du numero " +
+            "(indicatif pays sans '+' ni '0' initial, ex: 24177xxxxxxx) et que l'operateur choisi correspond au numero.",
       });
     }
     res.status(500).json({ error: "Erreur serveur lors de l'initialisation du paiement." });
@@ -470,7 +493,7 @@ app.post('/api/premium/ebilling/notify', async (req, res) => {
     await pendingRef.delete();
     res.sendStatus(200);
   } catch (err) {
-    console.error('premium notify error:', err.response?.data || err.message);
+    logAxiosError('premium notify error:', err);
     res.sendStatus(200);
   }
 });
