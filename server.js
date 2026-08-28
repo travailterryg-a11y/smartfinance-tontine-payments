@@ -47,6 +47,28 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Verifie le jeton Firebase envoye par l'app (header "Authorization: Bearer
+// <idToken>") et attache l'uid VERIFIE a req.uid. Avant ce middleware,
+// init-payment faisait confiance a un champ "uid" envoye tel quel dans le
+// corps de la requete : n'importe qui pouvait donc initier un paiement en
+// se faisant passer pour un autre participant (le paiement reel arriverait
+// bien, mais la cotisation serait attribuee a la mauvaise personne, lui
+// permettant de "sauter" son tour sans jamais payer).
+async function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const idToken = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!idToken) {
+    return res.status(401).json({ error: 'Authentification requise.' });
+  }
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.uid = decoded.uid;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Jeton invalide ou expire.' });
+  }
+}
+
 // Devises acceptees par CinetPay (zone UEMOA/CEMAC principalement). Le
 // modele "currencySymbol" cote app est un texte libre (ex: "FCFA") -> on le
 // fait correspondre au code ISO attendu par CinetPay. Ajuste cette table si
@@ -74,10 +96,11 @@ function sanitizeForTransactionId(value) {
 //    (jamais du client) pour qu'un client modifie ne puisse pas payer moins
 //    que sa cotisation reelle.
 // ---------------------------------------------------------------------------
-app.post('/api/tontine/init-payment', async (req, res) => {
+app.post('/api/tontine/init-payment', requireAuth, async (req, res) => {
   try {
-    const { tontineId, roundIndex, uid, payerName, payerPhone } = req.body;
-    if (!tontineId || roundIndex === undefined || !uid || !payerPhone) {
+    const { tontineId, roundIndex, payerName, payerPhone } = req.body;
+    const uid = req.uid; // jamais depuis req.body : voir requireAuth ci-dessus.
+    if (!tontineId || roundIndex === undefined || !payerPhone) {
       return res.status(400).json({ error: 'Parametres manquants.' });
     }
 
@@ -233,7 +256,7 @@ app.get('/api/tontine/return', (req, res) => {
 //    l'activation - ne pas activer TRANSFER_ENABLED sans avoir valide ces
 //    details avec CinetPay au prealable.
 // ---------------------------------------------------------------------------
-app.post('/api/tontine/payout', async (req, res) => {
+app.post('/api/tontine/payout', requireAuth, async (req, res) => {
   if (TRANSFER_ENABLED !== 'true') {
     return res.status(503).json({
       error:
@@ -245,9 +268,18 @@ app.post('/api/tontine/payout', async (req, res) => {
 
   try {
     const { tontineId, roundIndex } = req.body;
+    if (!tontineId || roundIndex === undefined) {
+      return res.status(400).json({ error: 'Parametres manquants.' });
+    }
     const tontineSnap = await db.collection('tontines').doc(tontineId).get();
     if (!tontineSnap.exists) return res.status(404).json({ error: 'Tontine introuvable.' });
     const tontine = tontineSnap.data();
+
+    // Reserve au createur : un virement reel ne doit jamais pouvoir etre
+    // declenche par n'importe qui connaissant/devinant un tontineId.
+    if (tontine.creatorUid !== req.uid) {
+      return res.status(403).json({ error: "Seul le createur de la tontine peut declencher un reversement." });
+    }
 
     const recipientUid = tontine.rotationOrder[roundIndex % tontine.rotationOrder.length];
     const recipientInfo = tontine.participantPaymentInfo?.[recipientUid];
@@ -255,39 +287,88 @@ app.post('/api/tontine/payout', async (req, res) => {
       return res.status(400).json({ error: "Le beneficiaire n'a pas renseigne ses informations de reception." });
     }
 
-    // Authentification CinetPay Transfert (jeton separe de l'API de paiement).
-    const authRes = await axios.post('https://client.cinetpay.com/v1/auth/login', {
-      apikey: CINETPAY_APIKEY,
-      password: CINETPAY_TRANSFER_PASSWORD,
-    });
-    const token = authRes.data?.data?.token;
-    if (!token) {
-      return res.status(502).json({ error: "Authentification CinetPay Transfert echouee." });
+    // Le tour doit etre complet (chaque participant a une cotisation
+    // verifiee pour ce tour precis) avant tout reversement — meme regle que
+    // TontineRotationCalculator.isRoundComplete cote app, pour ne jamais
+    // reverser un pot partiel.
+    const verifiedSnap = await db
+      .collection('tontines')
+      .doc(tontineId)
+      .collection('contributions')
+      .where('roundIndex', '==', roundIndex)
+      .where('status', '==', 'verified')
+      .get();
+    const contributorUids = new Set(verifiedSnap.docs.map((d) => d.data().uid));
+    const participantUids = Array.isArray(tontine.participantUids) ? tontine.participantUids : [];
+    const roundComplete = participantUids.length > 0 && participantUids.every((u) => contributorUids.has(u));
+    if (!roundComplete) {
+      return res.status(400).json({ error: "Tous les participants n'ont pas encore une cotisation verifiee pour ce tour." });
     }
 
-    const verifiedCount = (
-      await db
-        .collection('tontines')
-        .doc(tontineId)
-        .collection('contributions')
-        .where('roundIndex', '==', roundIndex)
-        .where('status', '==', 'verified')
-        .get()
-    ).size;
-    const totalAmount = Math.round(Number(tontine.contributionAmount) * verifiedCount);
-
-    const transferRes = await axios.post(
-      `https://client.cinetpay.com/v1/transfer/money/send/contact?token=${token}`,
-      {
-        prefix: '',
-        phone: recipientInfo.accountNumber,
-        amount: totalAmount,
-        notify_url: `${PUBLIC_BACKEND_URL}/api/tontine/transfer-notify`,
-        client_transaction_id: `payout_${sanitizeForTransactionId(tontineId)}_${roundIndex}_${Date.now()}`,
+    // Garde anti-double-reversement : un document de verrou par tour, cree
+    // de facon atomique. Si le tour a deja ete reverse (ou est en cours de
+    // traitement par un appel concurrent), on refuse plutot que d'envoyer un
+    // deuxieme virement pour le meme pot.
+    const payoutLockRef = db.collection('tontines').doc(tontineId).collection('payouts').doc(String(roundIndex));
+    try {
+      await db.runTransaction(async (tx) => {
+        const existing = await tx.get(payoutLockRef);
+        if (existing.exists) {
+          throw new Error('ALREADY_PAID_OUT');
+        }
+        tx.set(payoutLockRef, {
+          status: 'processing',
+          triggeredBy: req.uid,
+          createdAt: admin.firestore.Timestamp.now(),
+        });
+      });
+    } catch (lockErr) {
+      if (lockErr.message === 'ALREADY_PAID_OUT') {
+        return res.status(409).json({ error: 'Ce tour a deja ete reverse (ou est en cours de traitement).' });
       }
-    );
+      throw lockErr;
+    }
 
-    res.json({ ok: true, detail: transferRes.data });
+    // A partir d'ici le verrou est pose : toute sortie en erreur doit le
+    // liberer (delete) plutot que le laisser bloque a "processing" pour
+    // toujours, sinon un echec transitoire (reseau, CinetPay indisponible)
+    // empecherait definitivement de reessayer ce tour.
+    try {
+      // Authentification CinetPay Transfert (jeton separe de l'API de paiement).
+      const authRes = await axios.post('https://client.cinetpay.com/v1/auth/login', {
+        apikey: CINETPAY_APIKEY,
+        password: CINETPAY_TRANSFER_PASSWORD,
+      });
+      const token = authRes.data?.data?.token;
+      if (!token) {
+        await payoutLockRef.delete();
+        return res.status(502).json({ error: "Authentification CinetPay Transfert echouee." });
+      }
+
+      const verifiedCount = verifiedSnap.size;
+      const totalAmount = Math.round(Number(tontine.contributionAmount) * verifiedCount);
+
+      const transferRes = await axios.post(
+        `https://client.cinetpay.com/v1/transfer/money/send/contact?token=${token}`,
+        {
+          prefix: '',
+          phone: recipientInfo.accountNumber,
+          amount: totalAmount,
+          notify_url: `${PUBLIC_BACKEND_URL}/api/tontine/transfer-notify`,
+          client_transaction_id: `payout_${sanitizeForTransactionId(tontineId)}_${roundIndex}_${Date.now()}`,
+        }
+      );
+
+      await payoutLockRef.set(
+        { status: 'done', amount: totalAmount, doneAt: admin.firestore.Timestamp.now() },
+        { merge: true }
+      );
+
+      res.json({ ok: true, detail: transferRes.data });
+    } catch (transferErr) {
+      await payoutLockRef.delete();
+      throw transferErr;
+    }
   } catch (err) {
     console.error('payout error:', err.response?.data || err.message);
     res.status(500).json({ error: 'Erreur lors du reversement.' });
