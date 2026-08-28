@@ -1,42 +1,84 @@
-// Serveur de paiement en ligne pour les tontines SmartFinance.
+// Serveur de paiement en ligne pour SmartFinance (tontines + Premium), via
+// E-Billing (Digitech Africa).
 //
-// Pourquoi un serveur separe : la cle secrete CinetPay ne doit jamais vivre
-// dans l'app Flutter (n'importe qui pourrait la lire dans l'APK et falsifier
-// des paiements). Firebase Cloud Functions aurait ete l'endroit naturel pour
-// ca, mais necessite le plan payant Blaze. Ce serveur Node independant,
-// deployable gratuitement (Render/Railway), joue le meme role : il initie le
-// paiement, recoit le webhook CinetPay, RE-VERIFIE le statut aupres de
-// CinetPay lui-meme (jamais confiance dans le contenu brut du webhook), puis
-// ecrit dans Firestore avec les droits d'administrateur.
+// Reecrit a partir de la VRAIE spec OpenAPI du compte marchand (lab.billing-
+// easy.net/api-docs/v1/swagger.yaml), pas d'une integration de reference
+// generique — cette spec a revele un fonctionnement different de ce qui
+// avait ete suppose au depart :
+//   - Authentification : OAuth2 client-credentials (Cognito), PAS de Basic
+//     Auth avec Username/SharedKey (celle-ci n'est acceptee que 3 mois,
+//     legacy, et bypasse les scopes).
+//   - Mobile money : PAS de page de paiement/checkout a ouvrir dans une
+//     WebView. Le flux est 100% API : on cree une facture (invoice), puis on
+//     declenche un "USSD push" — E-Billing envoie directement une invite
+//     USSD sur le telephone du payeur, qui valide depuis son propre menu
+//     operateur. On n'a plus qu'a attendre la confirmation (webhook + geste
+//     verifie via l'endpoint d'enquete GET).
+//   - Carte bancaire (CyberSource "Unified Checkout") : necessite d'heberger
+//     le SDK JS CyberSource sur une page web et de gerer un "capture
+//     context" — hors scope ici, pas implemente (mobile money uniquement).
+//
+// Pourquoi un serveur separe : le client_secret E-Billing ne doit jamais
+// vivre dans l'app Flutter. Firebase Cloud Functions aurait ete l'endroit
+// naturel pour ca, mais necessite le plan payant Blaze. Ce serveur Node
+// independant, deployable gratuitement (Render/Railway), initie le paiement,
+// recoit le webhook, RE-VERIFIE le statut aupres d'E-Billing lui-meme
+// (jamais confiance dans le contenu brut du webhook), puis ecrit dans
+// Firestore avec les droits d'administrateur.
 //
 // Ce serveur ne fait PARTIE d'aucun build Flutter : c'est un projet Node
 // independant, a deployer separement. Voir README.md pour le deploiement.
-
+//
+// ATTENTION — points a reverifier aupres du compte marchand reel :
+//   1. Les URLs de base 'staging'/'production' sont deduites par analogie
+//      avec 'lab.billing-easy.net' (confirme par la spec) — a confirmer
+//      quand des accès staging/production existeront.
+//   2. La cle de signature des webhooks (X-Signature) : la spec confirme le
+//      format HMAC-SHA256 mais pas OU trouver cette cle dans le tableau de
+//      bord marchand (probablement distincte du client_secret). Sans elle,
+//      la verification de signature est desactivee (voir
+//      EBILLING_WEBHOOK_SIGNING_KEY) et on s'appuie uniquement sur la
+//      re-verification via l'endpoint GET d'enquete — deja une protection
+//      solide en soi, mais ajoute la cle des que tu l'as trouvee.
+//   3. L'URL de notification (notification_url) et son format exact des
+//      champs (notification_params) se configurent dans le tableau de bord
+//      marchand, pas par requete — a renseigner toi-meme avec les chemins
+//      /api/tontine/ebilling/notify et /api/premium/ebilling/notify de ce
+//      serveur une fois deploye.
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const crypto = require('crypto');
 const admin = require('firebase-admin');
 
 const {
   PORT = 3000,
-  CINETPAY_APIKEY,
-  CINETPAY_SITE_ID,
-  CINETPAY_BASE_URL = 'https://api-checkout.cinetpay.com/v2',
+  EBILLING_CLIENT_ID,
+  EBILLING_CLIENT_SECRET,
+  // 'lab' (bac a sable, par defaut), 'staging' ou 'production'.
+  EBILLING_ENV = 'lab',
+  // Optionnelle : voir l'avertissement n°2 ci-dessus.
+  EBILLING_WEBHOOK_SIGNING_KEY,
   PUBLIC_BACKEND_URL,
   FIREBASE_SERVICE_ACCOUNT,
-  TRANSFER_ENABLED,
-  CINETPAY_TRANSFER_LOGIN,
-  CINETPAY_TRANSFER_PASSWORD,
 } = process.env;
 
-if (!CINETPAY_APIKEY || !CINETPAY_SITE_ID || !PUBLIC_BACKEND_URL || !FIREBASE_SERVICE_ACCOUNT) {
+if (!EBILLING_CLIENT_ID || !EBILLING_CLIENT_SECRET || !PUBLIC_BACKEND_URL || !FIREBASE_SERVICE_ACCOUNT) {
   console.error(
     'Variables d\'environnement manquantes. Copie .env.example en .env et remplis-le ' +
       '(voir README.md).'
   );
   process.exit(1);
 }
+
+// Seule 'lab' est confirmee par la spec reelle — voir avertissement n°1.
+const EBILLING_ENVIRONMENTS = {
+  lab: 'https://lab.billing-easy.net',
+  staging: 'https://stg.billing-easy.com',
+  production: 'https://www.billing-easy.com',
+};
+const EBILLING_API_BASE = EBILLING_ENVIRONMENTS[EBILLING_ENV] || EBILLING_ENVIRONMENTS.lab;
 
 admin.initializeApp({
   credential: admin.credential.cert(JSON.parse(FIREBASE_SERVICE_ACCOUNT)),
@@ -45,15 +87,15 @@ const db = admin.firestore();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// `verify` capture le corps brut (avant parsing) pour la verification de
+// signature HMAC des webhooks, qui porte sur le corps exact tel qu'envoye.
+app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); } }));
+app.use(express.urlencoded({ extended: false, verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); } }));
 
 // Verifie le jeton Firebase envoye par l'app (header "Authorization: Bearer
-// <idToken>") et attache l'uid VERIFIE a req.uid. Avant ce middleware,
-// init-payment faisait confiance a un champ "uid" envoye tel quel dans le
-// corps de la requete : n'importe qui pouvait donc initier un paiement en
-// se faisant passer pour un autre participant (le paiement reel arriverait
-// bien, mais la cotisation serait attribuee a la mauvaise personne, lui
-// permettant de "sauter" son tour sans jamais payer).
+// <idToken>") et attache l'uid VERIFIE a req.uid — jamais un uid envoye tel
+// quel dans le corps de la requete, qui permettrait de se faire passer pour
+// quelqu'un d'autre.
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const idToken = header.startsWith('Bearer ') ? header.slice(7) : null;
@@ -69,38 +111,126 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// Devises acceptees par CinetPay (zone UEMOA/CEMAC principalement). Le
-// modele "currencySymbol" cote app est un texte libre (ex: "FCFA") -> on le
-// fait correspondre au code ISO attendu par CinetPay. Ajuste cette table si
-// tes utilisateurs sont dans une devise non listee ici.
-function toCinetpayCurrency(currencySymbol) {
-  const map = {
-    FCFA: 'XOF',
-    XOF: 'XOF',
-    XAF: 'XAF',
-    CDF: 'CDF',
-    GNF: 'GNF',
-    USD: 'USD',
-    EUR: 'EUR',
-  };
-  return map[(currencySymbol || '').toUpperCase()] || 'XOF';
-}
-
 function sanitizeForTransactionId(value) {
   return String(value).replace(/[^a-zA-Z0-9]/g, '').slice(0, 20);
 }
 
 // ---------------------------------------------------------------------------
-// 1) Initier un paiement : l'app appelle cette route quand le participant
-//    tape "Payer en ligne". Le montant vient de la tontine cote SERVEUR
-//    (jamais du client) pour qu'un client modifie ne puisse pas payer moins
-//    que sa cotisation reelle.
+// Authentification OAuth2 (Cognito, client-credentials) — un jeton est
+// mis en cache en memoire et reutilise jusqu'a ~1 minute avant son
+// expiration, pour ne pas en redemander un a chaque appel.
+// ---------------------------------------------------------------------------
+let cachedToken = null;
+let cachedTokenExpiresAt = 0;
+
+async function getEbillingToken() {
+  if (cachedToken && cachedTokenExpiresAt > Date.now() + 60_000) {
+    return cachedToken;
+  }
+  const res = await axios.post(
+    `${EBILLING_API_BASE}/oauth/token`,
+    new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: EBILLING_CLIENT_ID,
+      client_secret: EBILLING_CLIENT_SECRET,
+    }),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+  );
+  cachedToken = res.data.access_token;
+  const expiresInSeconds = Number(res.data.expires_in) || 55 * 60;
+  cachedTokenExpiresAt = Date.now() + expiresInSeconds * 1000;
+  return cachedToken;
+}
+
+async function ebillingRequest(method, path, { data, params } = {}) {
+  const token = await getEbillingToken();
+  return axios({
+    method,
+    url: `${EBILLING_API_BASE}${path}`,
+    data,
+    params,
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+  });
+}
+
+// Cree une facture (invoice/e_bill) — le montant et la reference externe
+// viennent TOUJOURS du serveur (jamais du client), voir chaque appelant.
+async function createInvoice({ amount, payerName, payerPhone, description, externalReference }) {
+  const res = await ebillingRequest('post', '/api/v1/merchant/e_bills', {
+    data: {
+      amount,
+      payer_msisdn: payerPhone,
+      payer_name: payerName,
+      short_description: description,
+      external_reference: externalReference,
+      client_transaction_id: externalReference,
+      email: false,
+      sms: false,
+      expiry_period: 24, // heures
+    },
+  });
+  const billId = res.data?.bill_id;
+  if (!billId) {
+    throw new Error("Reponse E-Billing invalide (bill_id manquant).");
+  }
+  return billId;
+}
+
+// Declenche l'invite USSD (mobile money) sur le telephone du payeur — c'est
+// CA qui demarre reellement le paiement, pas la creation de facture seule.
+// `operator` : 'AIRTEL' | 'MOOV' (voir payment_system_name dans la spec).
+async function triggerUssdPush({ billId, operator, payerPhone }) {
+  const res = await ebillingRequest('post', `/api/v2/merchant/e_bills/${encodeURIComponent(billId)}/ussd_push`, {
+    data: {
+      payment_system_name: operator,
+      payer_msisdn: payerPhone,
+    },
+  });
+  const ussdPush = res.data?.ussd_push;
+  if (!ussdPush?.id) {
+    throw new Error("Reponse E-Billing invalide (ussd_push.id manquant).");
+  }
+  return ussdPush;
+}
+
+// Re-interroge l'etat reel du push USSD — jamais sur la seule foi du contenu
+// du webhook, qui pourrait etre forge par n'importe qui connaissant l'URL de
+// notification.
+async function getUssdPushStatus(ussdPushId) {
+  const res = await ebillingRequest('get', `/api/v2/merchant/ussd_push/${encodeURIComponent(ussdPushId)}`);
+  return res.data;
+}
+
+// Verification de signature HMAC (defense en profondeur) — voir
+// l'avertissement n°2 en tete de fichier. Retourne `null` si aucune cle
+// n'est configuree (verification desactivee, on s'appuie alors uniquement
+// sur getUssdPushStatus ci-dessus), `true`/`false` sinon.
+function verifyWebhookSignature(req) {
+  if (!EBILLING_WEBHOOK_SIGNING_KEY) return null;
+  const signature = req.headers['x-signature'];
+  const timestamp = req.headers['x-signature-timestamp'];
+  if (!signature || !timestamp) return false;
+  const bodyHash = crypto.createHash('sha256').update(req.rawBody || '').digest('hex');
+  const payload = `${timestamp}.${req.method}.${req.originalUrl}.${bodyHash}`;
+  const expected = crypto.createHmac('sha256', EBILLING_WEBHOOK_SIGNING_KEY).update(payload).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 1) Tontines — initier un paiement : l'app appelle cette route quand le
+//    participant a choisi son operateur et tape "Payer en ligne". Le montant
+//    vient de la tontine cote SERVEUR (jamais du client). Cree la facture ET
+//    declenche immediatement le push USSD (deux appels E-Billing).
 // ---------------------------------------------------------------------------
 app.post('/api/tontine/init-payment', requireAuth, async (req, res) => {
   try {
-    const { tontineId, roundIndex, payerName, payerPhone } = req.body;
-    const uid = req.uid; // jamais depuis req.body : voir requireAuth ci-dessus.
-    if (!tontineId || roundIndex === undefined || !payerPhone) {
+    const { tontineId, roundIndex, payerName, payerPhone, operator } = req.body;
+    const uid = req.uid;
+    if (!tontineId || roundIndex === undefined || !payerPhone || !operator) {
       return res.status(400).json({ error: 'Parametres manquants.' });
     }
 
@@ -114,92 +244,79 @@ app.post('/api/tontine/init-payment', requireAuth, async (req, res) => {
     }
 
     const amount = Math.round(Number(tontine.contributionAmount));
-    const currency = toCinetpayCurrency(tontine.currencySymbol);
-    const transactionId = `tt${sanitizeForTransactionId(tontineId)}r${roundIndex}${sanitizeForTransactionId(
+    const externalReference = `tt${sanitizeForTransactionId(tontineId)}r${roundIndex}${sanitizeForTransactionId(
       uid
     )}${Date.now()}`;
 
-    const payload = {
-      apikey: CINETPAY_APIKEY,
-      site_id: CINETPAY_SITE_ID,
-      transaction_id: transactionId,
+    const billId = await createInvoice({
       amount,
-      currency,
+      payerName: payerName || 'Participant',
+      payerPhone,
       description: `Cotisation tontine ${tontine.name} - tour ${Number(roundIndex) + 1}`,
-      notify_url: `${PUBLIC_BACKEND_URL}/api/tontine/cinetpay/notify`,
-      return_url: `${PUBLIC_BACKEND_URL}/api/tontine/return`,
-      channels: 'ALL',
-      customer_name: payerName || 'Participant',
-      customer_surname: 'SmartFinance',
-      customer_phone_number: payerPhone,
-    };
+      externalReference,
+    });
+    const ussdPush = await triggerUssdPush({ billId, operator, payerPhone });
 
-    const cinetpayRes = await axios.post(`${CINETPAY_BASE_URL}/payment`, payload);
-    const data = cinetpayRes.data;
-
-    if (data.code !== '201') {
-      console.error('CinetPay init refuse :', data);
-      return res.status(502).json({ error: "CinetPay a refuse l'initialisation.", detail: data.message });
-    }
-
-    // Trace en attente (collection racine, cle = transaction_id) pour que le
-    // webhook puisse retrouver directement la tontine/le tour/le montant
-    // sans avoir a les re-deviner depuis le texte du transaction_id.
-    await db.collection('pendingOnlinePayments').doc(transactionId).set({
+    await db.collection('pendingOnlinePayments').doc(externalReference).set({
       tontineId,
       uid,
       roundIndex: Number(roundIndex),
       amount,
-      currency,
+      billId,
+      ussdPushId: String(ussdPush.id),
       createdAt: admin.firestore.Timestamp.now(),
     });
 
-    res.json({ paymentUrl: data.data.payment_url, transactionId });
+    res.json({ transactionId: externalReference, ussdPushId: String(ussdPush.id) });
   } catch (err) {
     console.error('init-payment error:', err.response?.data || err.message);
+    if (err.response?.status === 406) {
+      return res.status(406).json({
+        error: err.response.data?.message || "Le prestataire de paiement a refuse l'operation.",
+      });
+    }
     res.status(500).json({ error: "Erreur serveur lors de l'initialisation du paiement." });
   }
 });
 
 // ---------------------------------------------------------------------------
-// 2) Webhook CinetPay : ne JAMAIS faire confiance au contenu de cette
-//    requete pour marquer un paiement comme reussi. On re-interroge
-//    CinetPay avec la cle secrete (cote serveur uniquement) pour confirmer
-//    le statut reel avant d'ecrire quoi que ce soit.
+// 2) Webhook E-Billing (tontines) — a configurer dans le tableau de bord
+//    marchand comme notification_url. Ne JAMAIS faire confiance au contenu
+//    de cette requete pour marquer un paiement comme reussi : on re-interroge
+//    l'etat reel via getUssdPushStatus avant d'ecrire quoi que ce soit.
 // ---------------------------------------------------------------------------
-app.post('/api/tontine/cinetpay/notify', async (req, res) => {
-  const transactionId = req.body.cpm_trans_id || req.body.transaction_id;
-  if (!transactionId) return res.sendStatus(400);
+app.post('/api/tontine/ebilling/notify', async (req, res) => {
+  // "reference" echo notre external_reference envoye a la creation.
+  const externalReference = req.body.reference;
+  if (!externalReference) return res.sendStatus(400);
+
+  if (verifyWebhookSignature(req) === false) {
+    console.error(`Signature invalide sur la notification ${externalReference}.`);
+    return res.sendStatus(401);
+  }
 
   try {
-    const checkRes = await axios.post(`${CINETPAY_BASE_URL}/payment/check`, {
-      apikey: CINETPAY_APIKEY,
-      site_id: CINETPAY_SITE_ID,
-      transaction_id: transactionId,
-    });
-    const result = checkRes.data;
-
-    if (result.code !== '00' || result.data?.status !== 'ACCEPTED') {
-      console.log(`Paiement ${transactionId} non accepte (statut: ${result.data?.status}).`);
-      return res.sendStatus(200); // on accuse reception malgre tout, sinon CinetPay reessaie indefiniment
-    }
-
-    // Retrouver la trace laissee a l'initialisation pour savoir a quelle
-    // tontine/tour/participant ce paiement correspond.
-    const pendingRef = db.collection('pendingOnlinePayments').doc(transactionId);
+    const pendingRef = db.collection('pendingOnlinePayments').doc(externalReference);
     const pendingSnap = await pendingRef.get();
     if (!pendingSnap.exists) {
-      console.error(`Aucune trace pendingOnlinePayments pour ${transactionId} (deja traite ?)`);
+      console.error(`Aucune trace pendingOnlinePayments pour ${externalReference} (deja traite ?)`);
       return res.sendStatus(200);
     }
     const pending = pendingSnap.data();
+
+    const status = await getUssdPushStatus(pending.ussdPushId);
+    if (status?.state !== 'paid') {
+      console.log(`Paiement ${externalReference} non confirme comme paye (etat: ${status?.state}).`);
+      return res.sendStatus(200); // on accuse reception malgre tout, sinon E-Billing reessaie indefiniment
+    }
+
     const tontineRef = db.collection('tontines').doc(pending.tontineId);
 
-    // Idempotence : si le webhook est livre plusieurs fois par CinetPay, ne
-    // pas creer deux cotisations pour le meme paiement.
+    // Idempotence : si le webhook est livre plusieurs fois, ne pas creer
+    // deux cotisations pour le meme paiement.
     const existing = await tontineRef
       .collection('contributions')
-      .where('onlineTransactionId', '==', transactionId)
+      .where('onlineTransactionId', '==', externalReference)
       .limit(1)
       .get();
     if (!existing.empty) {
@@ -213,16 +330,15 @@ app.post('/api/tontine/cinetpay/notify', async (req, res) => {
       amount: pending.amount,
       date: admin.firestore.Timestamp.now(),
       proofImageBase64: '',
-      status: 'verified', // paiement confirme par CinetPay lui-meme, pas besoin de verification humaine
-      verifiedBy: 'cinetpay',
+      status: 'verified', // paiement confirme par E-Billing lui-meme, pas besoin de verification humaine
+      verifiedBy: 'ebilling',
       verifiedAt: admin.firestore.Timestamp.now(),
       transactionLogged: false,
       paymentMethod: 'online',
-      onlineTransactionId: transactionId,
+      onlineTransactionId: externalReference,
     });
 
     await pendingRef.delete();
-
     res.sendStatus(200);
   } catch (err) {
     console.error('notify error:', err.response?.data || err.message);
@@ -233,148 +349,153 @@ app.post('/api/tontine/cinetpay/notify', async (req, res) => {
   }
 });
 
-// Page affichee dans la WebView apres le paiement (CinetPay redirige ici).
-// L'app Flutter detecte la navigation vers /api/tontine/return et ferme la
-// WebView elle-meme ; cette page n'est qu'un filet de securite si jamais
-// l'utilisateur la voit quelques instants.
-app.get('/api/tontine/return', (req, res) => {
-  res.send(`<!doctype html><html><head><meta charset="utf-8">
-    <title>Paiement en cours de confirmation</title></head>
-    <body style="font-family: sans-serif; text-align:center; padding-top:60px;">
-      <h2>Paiement recu</h2>
-      <p>Tu peux retourner sur l'application SmartFinance.</p>
-    </body></html>`);
+// ---------------------------------------------------------------------------
+// 3) Abonnement Premium — meme principe que les tontines : le prix vient
+//    d'une table cote SERVEUR (jamais du client), et seul ce serveur (Admin
+//    SDK) peut ecrire 'premium'/'premiumExpireAt' — firestore.rules
+//    l'interdit explicitement au client (fieldUnchanged('premium')).
+//
+//    Facture en XAF (compte marchand E-Billing, base Gabon/CEMAC) — pas de
+//    conversion automatique par pays pour l'instant : une vraie tarification
+//    multi-devises est une decision produit a part entiere, pas traitee ici.
+// ---------------------------------------------------------------------------
+const PREMIUM_PLANS = {
+  mensuel: { amount: 3000, days: 30 },
+  annuel: { amount: 35000, days: 365 },
+};
+
+app.post('/api/premium/init-payment', requireAuth, async (req, res) => {
+  try {
+    const { premiumType, payerName, payerPhone, operator } = req.body;
+    const uid = req.uid;
+    const plan = PREMIUM_PLANS[premiumType];
+    if (!plan || !payerPhone || !operator) {
+      return res.status(400).json({ error: 'Parametres manquants ou plan invalide.' });
+    }
+
+    const externalReference = `pm${sanitizeForTransactionId(uid)}${premiumType}${Date.now()}`;
+
+    const billId = await createInvoice({
+      amount: plan.amount,
+      payerName: payerName || 'Client',
+      payerPhone,
+      description: `Abonnement SmartFinance Premium (${premiumType})`,
+      externalReference,
+    });
+    const ussdPush = await triggerUssdPush({ billId, operator, payerPhone });
+
+    await db.collection('pendingPremiumPayments').doc(externalReference).set({
+      uid,
+      premiumType,
+      days: plan.days,
+      amount: plan.amount,
+      billId,
+      ussdPushId: String(ussdPush.id),
+      createdAt: admin.firestore.Timestamp.now(),
+    });
+
+    res.json({ transactionId: externalReference, ussdPushId: String(ussdPush.id) });
+  } catch (err) {
+    console.error('premium init-payment error:', err.response?.data || err.message);
+    if (err.response?.status === 406) {
+      return res.status(406).json({
+        error: err.response.data?.message || "Le prestataire de paiement a refuse l'operation.",
+      });
+    }
+    res.status(500).json({ error: "Erreur serveur lors de l'initialisation du paiement." });
+  }
 });
 
-// ---------------------------------------------------------------------------
-// 3) Reversement au beneficiaire du tour. DESACTIVE PAR DEFAUT.
-//
-//    Contrairement au paiement (bien documente et stable chez CinetPay),
-//    l'API de transfert d'argent CinetPay necessite une activation
-//    contractuelle separee (KYC) et ses parametres exacts doivent etre
-//    verifies aupres du support CinetPay / du tableau de bord au moment de
-//    l'activation - ne pas activer TRANSFER_ENABLED sans avoir valide ces
-//    details avec CinetPay au prealable.
-// ---------------------------------------------------------------------------
-app.post('/api/tontine/payout', requireAuth, async (req, res) => {
-  if (TRANSFER_ENABLED !== 'true') {
-    return res.status(503).json({
-      error:
-        "Le reversement automatique n'est pas active. Active la fonctionnalite " +
-        '"Transfert d\'argent" sur ton compte CinetPay (KYC requis), puis passe ' +
-        'TRANSFER_ENABLED=true et renseigne CINETPAY_TRANSFER_LOGIN/PASSWORD.',
-    });
+app.post('/api/premium/ebilling/notify', async (req, res) => {
+  const externalReference = req.body.reference;
+  if (!externalReference) return res.sendStatus(400);
+
+  if (verifyWebhookSignature(req) === false) {
+    console.error(`Signature invalide sur la notification premium ${externalReference}.`);
+    return res.sendStatus(401);
   }
 
   try {
-    const { tontineId, roundIndex } = req.body;
-    if (!tontineId || roundIndex === undefined) {
-      return res.status(400).json({ error: 'Parametres manquants.' });
+    const pendingRef = db.collection('pendingPremiumPayments').doc(externalReference);
+    const pendingSnap = await pendingRef.get();
+    if (!pendingSnap.exists) {
+      console.error(`Aucune trace pendingPremiumPayments pour ${externalReference} (deja traite ?)`);
+      return res.sendStatus(200);
     }
-    const tontineSnap = await db.collection('tontines').doc(tontineId).get();
-    if (!tontineSnap.exists) return res.status(404).json({ error: 'Tontine introuvable.' });
-    const tontine = tontineSnap.data();
+    const pending = pendingSnap.data();
 
-    // Reserve au createur : un virement reel ne doit jamais pouvoir etre
-    // declenche par n'importe qui connaissant/devinant un tontineId.
-    if (tontine.creatorUid !== req.uid) {
-      return res.status(403).json({ error: "Seul le createur de la tontine peut declencher un reversement." });
-    }
-
-    const recipientUid = tontine.rotationOrder[roundIndex % tontine.rotationOrder.length];
-    const recipientInfo = tontine.participantPaymentInfo?.[recipientUid];
-    if (!recipientInfo || !recipientInfo.accountNumber) {
-      return res.status(400).json({ error: "Le beneficiaire n'a pas renseigne ses informations de reception." });
+    const status = await getUssdPushStatus(pending.ussdPushId);
+    if (status?.state !== 'paid') {
+      console.log(`Paiement premium ${externalReference} non confirme comme paye (etat: ${status?.state}).`);
+      return res.sendStatus(200);
     }
 
-    // Le tour doit etre complet (chaque participant a une cotisation
-    // verifiee pour ce tour precis) avant tout reversement — meme regle que
-    // TontineRotationCalculator.isRoundComplete cote app, pour ne jamais
-    // reverser un pot partiel.
-    const verifiedSnap = await db
-      .collection('tontines')
-      .doc(tontineId)
-      .collection('contributions')
-      .where('roundIndex', '==', roundIndex)
-      .where('status', '==', 'verified')
-      .get();
-    const contributorUids = new Set(verifiedSnap.docs.map((d) => d.data().uid));
-    const participantUids = Array.isArray(tontine.participantUids) ? tontine.participantUids : [];
-    const roundComplete = participantUids.length > 0 && participantUids.every((u) => contributorUids.has(u));
-    if (!roundComplete) {
-      return res.status(400).json({ error: "Tous les participants n'ont pas encore une cotisation verifiee pour ce tour." });
+    const userRef = db.collection('users').doc(pending.uid);
+
+    // Idempotence : si E-Billing livre le webhook plusieurs fois, ne pas
+    // prolonger l'abonnement une deuxieme fois pour le meme paiement. Le
+    // document premiumPayments/{externalReference} sert a la fois de garde
+    // d'idempotence et de signal que l'app ecoute pour confirmer le succes.
+    const paymentRecordRef = userRef.collection('premiumPayments').doc(externalReference);
+    const alreadyProcessed = await paymentRecordRef.get();
+    if (alreadyProcessed.exists) {
+      await pendingRef.delete();
+      return res.sendStatus(200);
     }
 
-    // Garde anti-double-reversement : un document de verrou par tour, cree
-    // de facon atomique. Si le tour a deja ete reverse (ou est en cours de
-    // traitement par un appel concurrent), on refuse plutot que d'envoyer un
-    // deuxieme virement pour le meme pot.
-    const payoutLockRef = db.collection('tontines').doc(tontineId).collection('payouts').doc(String(roundIndex));
-    try {
-      await db.runTransaction(async (tx) => {
-        const existing = await tx.get(payoutLockRef);
-        if (existing.exists) {
-          throw new Error('ALREADY_PAID_OUT');
-        }
-        tx.set(payoutLockRef, {
-          status: 'processing',
-          triggeredBy: req.uid,
-          createdAt: admin.firestore.Timestamp.now(),
-        });
+    await db.runTransaction(async (tx) => {
+      const userSnap = await tx.get(userRef);
+      const userData = userSnap.data() || {};
+      const now = admin.firestore.Timestamp.now();
+      const currentExpiry = userData.premiumExpireAt;
+      // Renouvellement anticipe : prolonge depuis la date d'expiration
+      // actuelle si elle n'est pas encore passee, pour ne pas faire perdre
+      // les jours deja payes a quelqu'un qui renouvelle en avance.
+      const base =
+        currentExpiry && currentExpiry.toMillis() > now.toMillis() ? currentExpiry.toDate() : now.toDate();
+      const newExpiry = new Date(base.getTime() + pending.days * 24 * 60 * 60 * 1000);
+
+      tx.update(userRef, {
+        premium: true,
+        premiumExpireAt: admin.firestore.Timestamp.fromDate(newExpiry),
       });
-    } catch (lockErr) {
-      if (lockErr.message === 'ALREADY_PAID_OUT') {
-        return res.status(409).json({ error: 'Ce tour a deja ete reverse (ou est en cours de traitement).' });
-      }
-      throw lockErr;
-    }
-
-    // A partir d'ici le verrou est pose : toute sortie en erreur doit le
-    // liberer (delete) plutot que le laisser bloque a "processing" pour
-    // toujours, sinon un echec transitoire (reseau, CinetPay indisponible)
-    // empecherait definitivement de reessayer ce tour.
-    try {
-      // Authentification CinetPay Transfert (jeton separe de l'API de paiement).
-      const authRes = await axios.post('https://client.cinetpay.com/v1/auth/login', {
-        apikey: CINETPAY_APIKEY,
-        password: CINETPAY_TRANSFER_PASSWORD,
+      tx.set(paymentRecordRef, {
+        status: 'confirmed',
+        premiumType: pending.premiumType,
+        amount: pending.amount,
+        confirmedAt: now,
       });
-      const token = authRes.data?.data?.token;
-      if (!token) {
-        await payoutLockRef.delete();
-        return res.status(502).json({ error: "Authentification CinetPay Transfert echouee." });
-      }
+    });
 
-      const verifiedCount = verifiedSnap.size;
-      const totalAmount = Math.round(Number(tontine.contributionAmount) * verifiedCount);
-
-      const transferRes = await axios.post(
-        `https://client.cinetpay.com/v1/transfer/money/send/contact?token=${token}`,
-        {
-          prefix: '',
-          phone: recipientInfo.accountNumber,
-          amount: totalAmount,
-          notify_url: `${PUBLIC_BACKEND_URL}/api/tontine/transfer-notify`,
-          client_transaction_id: `payout_${sanitizeForTransactionId(tontineId)}_${roundIndex}_${Date.now()}`,
-        }
-      );
-
-      await payoutLockRef.set(
-        { status: 'done', amount: totalAmount, doneAt: admin.firestore.Timestamp.now() },
-        { merge: true }
-      );
-
-      res.json({ ok: true, detail: transferRes.data });
-    } catch (transferErr) {
-      await payoutLockRef.delete();
-      throw transferErr;
-    }
+    await pendingRef.delete();
+    res.sendStatus(200);
   } catch (err) {
-    console.error('payout error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Erreur lors du reversement.' });
+    console.error('premium notify error:', err.response?.data || err.message);
+    res.sendStatus(200);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 4) Reversement au beneficiaire du tour (PAYOUT) — NON IMPLEMENTE.
+//
+//    La spec obtenue declare les tags "Payouts"/"Cash-in"/"KYC"/"Account"
+//    mais ne liste aucun chemin pour eux — probablement des scopes non
+//    encore accordes a ce compte marchand. Impossible a integrer
+//    honnetement sans deviner des noms d'endpoint. En attendant, le systeme
+//    existant reste disponible en parallele : chaque beneficiaire renseigne
+//    ses coordonnees de reception dans l'app, et les autres participants
+//    paient manuellement puis televersent une preuve (bouton "J'ai payé"),
+//    verifiee par un humain.
+// ---------------------------------------------------------------------------
+app.post('/api/tontine/payout', requireAuth, async (_req, res) => {
+  res.status(501).json({
+    error:
+      "Le reversement automatique n'est pas implemente. La documentation E-Billing pour les " +
+      "endpoints Payout n'apparait pas encore sur ce compte marchand — recontacte Digitech " +
+      "Africa pour faire activer ce scope, puis reviens completer cette route avec la vraie spec.",
+  });
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () => console.log(`Serveur de paiement tontine demarre sur le port ${PORT}`));
+app.listen(PORT, () => console.log(`Serveur de paiement demarre sur le port ${PORT} (E-Billing, env=${EBILLING_ENV})`));
