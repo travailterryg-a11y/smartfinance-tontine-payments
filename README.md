@@ -137,6 +137,17 @@ reconfigure temporairement tes URLs de notification dessus le temps du test.
 - Idempotence : un meme paiement confirme deux fois par E-Billing (retries)
   ne cree/ne prolonge jamais deux fois.
 
+### Tableau de bord admin
+
+6. **Routes `/api/admin/*`** (`GET /me`, `GET /users`, `GET /users/:uid`,
+   `POST /users/:uid/premium`, `GET /stats`, `GET /revenue`, `GET /logs`) :
+   utilisées uniquement par l'app web séparée `admin_web/` (voir son propre
+   README) — jamais par l'app mobile. Protégées par `requireAdmin` : jeton
+   Firebase valide + UID présent dans la variable d'environnement
+   `ADMIN_UIDS` (liste séparée par des virgules, à ajouter toi-même sur
+   Render — voir `.env.example`). Sans cette variable configurée, ces routes
+   refusent tout le monde (403).
+
 ## Hors scope pour l'instant
 
 - **Paiement par carte** (Visa/Mastercard via CyberSource Unified Checkout) —

@@ -111,6 +111,27 @@ async function requireAuth(req, res, next) {
   }
 }
 
+// Liste blanche d'UID admin (app web separee, tableau de bord) — jamais
+// exposee au client ni aux regles Firestore, seulement a ce serveur. Sans
+// cette variable d'environnement configuree, requireAdmin refuse tout le
+// monde (403), plutot que de planter tout le serveur de paiement pour une
+// fonctionnalite qui lui est independante.
+const ADMIN_UIDS = (process.env.ADMIN_UIDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Reutilise requireAuth (verifie le jeton Firebase), puis verifie
+// l'appartenance a ADMIN_UIDS avant de laisser passer.
+function requireAdmin(req, res, next) {
+  requireAuth(req, res, () => {
+    if (!ADMIN_UIDS.includes(req.uid)) {
+      return res.status(403).json({ error: 'Acces reserve aux administrateurs.' });
+    }
+    next();
+  });
+}
+
 function sanitizeForTransactionId(value) {
   return String(value).replace(/[^a-zA-Z0-9]/g, '').slice(0, 20);
 }
@@ -517,6 +538,261 @@ app.post('/api/tontine/payout', requireAuth, async (_req, res) => {
       "endpoints Payout n'apparait pas encore sur ce compte marchand — recontacte Digitech " +
       "Africa pour faire activer ce scope, puis reviens completer cette route avec la vraie spec.",
   });
+});
+
+// ---------------------------------------------------------------------------
+// 5) Administration — tableau de bord admin (app web Flutter separee,
+//    admin_web/). Ces routes lisent/ecrivent avec l'Admin SDK, donc en
+//    dehors des regles Firestore (isOwner) : l'app web admin n'ouvre jamais
+//    Firestore directement, elle passe exclusivement par ces endpoints,
+//    proteges par requireAdmin.
+// ---------------------------------------------------------------------------
+app.get('/api/admin/me', requireAdmin, (req, res) => {
+  res.json({ uid: req.uid, isAdmin: true });
+});
+
+// Liste paginee des utilisateurs. Firestore n'offre pas de recherche plein
+// texte : `search` fait un prefix-match sur `name` (limite native, pas de
+// contournement ici).
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+  try {
+    const { cursor, search } = req.query;
+    const pageSize = Math.min(Number(req.query.limit) || 25, 100);
+
+    let query = search
+      ? db.collection('users').orderBy('name').startAt(search).endAt(`${search}`)
+      : db.collection('users').orderBy('createdAt', 'desc');
+
+    if (cursor) {
+      const cursorSnap = await db.collection('users').doc(String(cursor)).get();
+      if (cursorSnap.exists) query = query.startAfter(cursorSnap);
+    }
+
+    const snap = await query.limit(pageSize).get();
+    const users = snap.docs.map((doc) => {
+      const data = doc.data();
+      return {
+        uid: doc.id,
+        name: data.name || null,
+        email: data.email || null,
+        premium: !!data.premium,
+        premiumSystem: data.premiumSystem || null,
+        premiumExpireAt: data.premiumExpireAt ? data.premiumExpireAt.toDate().toISOString() : null,
+        createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null,
+      };
+    });
+
+    res.json({
+      users,
+      nextCursor: snap.docs.length === pageSize ? snap.docs[snap.docs.length - 1].id : null,
+    });
+  } catch (err) {
+    console.error('admin users list error:', err.message);
+    res.status(500).json({ error: 'Erreur serveur lors de la liste des utilisateurs.' });
+  }
+});
+
+app.get('/api/admin/users/:uid', requireAdmin, async (req, res) => {
+  try {
+    const userRef = db.collection('users').doc(req.params.uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      return res.status(404).json({ error: 'Utilisateur introuvable.' });
+    }
+    const data = userSnap.data();
+
+    const [budgetsSnap, goalsSnap, debtsSnap, billsSnap] = await Promise.all([
+      userRef.collection('budgets').get(),
+      userRef.collection('goals').get(),
+      userRef.collection('debts').get(),
+      userRef.collection('bills').get(),
+    ]);
+
+    res.json({
+      uid: userSnap.id,
+      ...data,
+      createdAt: data.createdAt ? data.createdAt.toDate().toISOString() : null,
+      updatedAt: data.updatedAt ? data.updatedAt.toDate().toISOString() : null,
+      premiumExpireAt: data.premiumExpireAt ? data.premiumExpireAt.toDate().toISOString() : null,
+      advisorConfigGeneratedAt: data.advisorConfigGeneratedAt
+        ? data.advisorConfigGeneratedAt.toDate().toISOString()
+        : null,
+      counts: {
+        budgets: budgetsSnap.size,
+        goals: goalsSnap.size,
+        debts: debtsSnap.size,
+        bills: billsSnap.size,
+      },
+    });
+  } catch (err) {
+    console.error('admin user detail error:', err.message);
+    res.status(500).json({ error: 'Erreur serveur lors de la lecture du profil.' });
+  }
+});
+
+// Bascule manuelle du statut premium — la SEULE ecriture privilegiee de ce
+// tableau de bord. Reprend la meme logique de prolongation que la
+// confirmation de paiement E-Billing (voir /api/premium/ebilling/notify
+// ci-dessus) pour rester coherent : un admin qui "recharge" un compte deja
+// premium prolonge depuis sa date d'expiration actuelle, pas depuis
+// aujourd'hui.
+app.post('/api/admin/users/:uid/premium', requireAdmin, async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const { premium, days } = req.body;
+    if (typeof premium !== 'boolean') {
+      return res.status(400).json({ error: 'Le champ "premium" (booleen) est requis.' });
+    }
+
+    const userRef = db.collection('users').doc(uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) {
+      return res.status(404).json({ error: 'Utilisateur introuvable.' });
+    }
+
+    if (!premium) {
+      await userRef.update({ premium: false, premiumExpireAt: null });
+      return res.json({ ok: true, premium: false });
+    }
+
+    const now = admin.firestore.Timestamp.now();
+    const currentExpiry = userSnap.data().premiumExpireAt;
+    const base = currentExpiry && currentExpiry.toMillis() > now.toMillis() ? currentExpiry.toDate() : now.toDate();
+    const extendDays = Number(days) > 0 ? Number(days) : 30;
+    const newExpiry = new Date(base.getTime() + extendDays * 24 * 60 * 60 * 1000);
+
+    await userRef.update({ premium: true, premiumExpireAt: admin.firestore.Timestamp.fromDate(newExpiry) });
+    res.json({ ok: true, premium: true, premiumExpireAt: newExpiry.toISOString() });
+  } catch (err) {
+    console.error('admin premium toggle error:', err.message);
+    res.status(500).json({ error: 'Erreur serveur lors de la bascule premium.' });
+  }
+});
+
+// Statistiques d'usage — calculees a la volee en lisant `users` (correct a
+// l'echelle actuelle ; a revoir avec des compteurs denormalises si la base
+// grossit fortement, pas fait ici, prematuré).
+app.get('/api/admin/stats', requireAdmin, async (_req, res) => {
+  try {
+    const snap = await db.collection('users').select('premium', 'premiumSystem', 'createdAt').get();
+
+    let premiumUsers = 0;
+    const premiumBySystem = {};
+    const signupsByMonth = {};
+
+    snap.forEach((doc) => {
+      const data = doc.data();
+      if (data.premium) {
+        premiumUsers += 1;
+        const sys = data.premiumSystem || 'inconnu';
+        premiumBySystem[sys] = (premiumBySystem[sys] || 0) + 1;
+      }
+      if (data.createdAt) {
+        const d = data.createdAt.toDate();
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        signupsByMonth[key] = (signupsByMonth[key] || 0) + 1;
+      }
+    });
+
+    res.json({
+      totalUsers: snap.size,
+      premiumUsers,
+      freeUsers: snap.size - premiumUsers,
+      premiumBySystem,
+      signupsByMonth,
+    });
+  } catch (err) {
+    console.error('admin stats error:', err.message);
+    res.status(500).json({ error: 'Erreur serveur lors du calcul des statistiques.' });
+  }
+});
+
+// Revenus — Premium confirme (`premiumPayments`, collectionGroup) + tontines
+// payees en ligne (`contributions`, collectionGroup, paymentMethod=online).
+// NOTE OPERATIONNELLE : une requete collectionGroup avec un filtre `where`
+// echoue la premiere fois avec un message Firestore contenant un lien direct
+// pour creer l'index composite manquant (console Firebase) — normal, a faire
+// une seule fois par requete de ce type.
+app.get('/api/admin/revenue', requireAdmin, async (_req, res) => {
+  try {
+    const paymentsSnap = await db.collectionGroup('premiumPayments').where('status', '==', 'confirmed').get();
+
+    let premiumTotal = 0;
+    const premiumByMonth = {};
+    const premiumByPlan = {};
+
+    paymentsSnap.forEach((doc) => {
+      const data = doc.data();
+      const amount = Number(data.amount) || 0;
+      premiumTotal += amount;
+      const plan = data.premiumType || 'inconnu';
+      premiumByPlan[plan] = (premiumByPlan[plan] || 0) + amount;
+      if (data.confirmedAt) {
+        const d = data.confirmedAt.toDate();
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        premiumByMonth[key] = (premiumByMonth[key] || 0) + amount;
+      }
+    });
+
+    const tontineSnap = await db.collectionGroup('contributions').where('paymentMethod', '==', 'online').get();
+    let tontineTotal = 0;
+    tontineSnap.forEach((doc) => {
+      tontineTotal += Number(doc.data().amount) || 0;
+    });
+
+    res.json({
+      premium: { totalAmount: premiumTotal, count: paymentsSnap.size, byMonth: premiumByMonth, byPlan: premiumByPlan },
+      tontineOnline: { totalAmount: tontineTotal, count: tontineSnap.size },
+    });
+  } catch (err) {
+    console.error('admin revenue error:', err.message);
+    res.status(500).json({
+      error:
+        'Erreur serveur lors du calcul des revenus (voir les logs Render : un index Firestore ' +
+        'manquant affiche un lien direct pour le creer).',
+    });
+  }
+});
+
+// Journal d'activite (collectionGroup sur `users/{uid}/activityLogs`, ecrit
+// par CHAQUE client dans sa propre sous-collection — voir
+// lib/services/logging/activity_logger.dart cote app mobile). Filtrable par
+// type ('screen_view' | 'action' | 'error'), par uid, et depuis une date.
+app.get('/api/admin/logs', requireAdmin, async (req, res) => {
+  try {
+    const { type, uid, since, cursor } = req.query;
+    const pageSize = Math.min(Number(req.query.limit) || 50, 200);
+
+    let query = db.collectionGroup('activityLogs').orderBy('timestamp', 'desc');
+    if (type) query = query.where('type', '==', String(type));
+    if (uid) query = query.where('uid', '==', String(uid));
+    if (since) query = query.where('timestamp', '>=', admin.firestore.Timestamp.fromDate(new Date(String(since))));
+    if (cursor) query = query.startAfter(admin.firestore.Timestamp.fromMillis(Number(cursor)));
+
+    const snap = await query.limit(pageSize).get();
+    const logs = snap.docs.map((doc) => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        uid: data.uid || doc.ref.parent.parent?.id || null,
+        type: data.type || null,
+        name: data.name || null,
+        data: data.data || null,
+        timestamp: data.timestamp ? data.timestamp.toDate().toISOString() : null,
+      };
+    });
+
+    const last = snap.docs[snap.docs.length - 1];
+    const lastTimestamp = last?.data()?.timestamp;
+    res.json({ logs, nextCursor: lastTimestamp ? lastTimestamp.toMillis() : null });
+  } catch (err) {
+    console.error('admin logs error:', err.message);
+    res.status(500).json({
+      error:
+        'Erreur serveur lors de la lecture des logs (voir les logs Render : un index Firestore ' +
+        'manquant affiche un lien direct pour le creer).',
+    });
+  }
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
