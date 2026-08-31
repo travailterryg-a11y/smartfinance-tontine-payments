@@ -111,24 +111,48 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// Liste blanche d'UID admin (app web separee, tableau de bord) — jamais
-// exposee au client ni aux regles Firestore, seulement a ce serveur. Sans
-// cette variable d'environnement configuree, requireAdmin refuse tout le
-// monde (403), plutot que de planter tout le serveur de paiement pour une
-// fonctionnalite qui lui est independante.
-const ADMIN_UIDS = (process.env.ADMIN_UIDS || '')
+// Liste blanche d'UID admin — deux niveaux :
+//   1) ADMIN_UIDS (variable d'environnement Render) : admins "amorce",
+//      jamais stockes en base, jamais supprimables depuis le dashboard —
+//      garantit qu'on ne peut jamais se retrouver bloque dehors meme si la
+//      collection Firestore ci-dessous est videe par erreur.
+//   2) Collection Firestore `adminUsers/{uid}` : admins geres depuis le
+//      dashboard admin lui-meme (ajout/suppression), voir /api/admin/admins
+//      plus bas. Mise en cache en memoire ~60s (meme principe que le jeton
+//      OAuth2 E-Billing plus haut) pour ne pas relire Firestore a chaque
+//      requete admin.
+const ADMIN_SEED_UIDS = (process.env.ADMIN_UIDS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
 
+let cachedAdminUids = null;
+let cachedAdminUidsAt = 0;
+const ADMIN_CACHE_TTL_MS = 60_000;
+
+async function getDynamicAdminUids() {
+  if (cachedAdminUids && Date.now() - cachedAdminUidsAt < ADMIN_CACHE_TTL_MS) {
+    return cachedAdminUids;
+  }
+  const snap = await db.collection('adminUsers').get();
+  cachedAdminUids = snap.docs.map((d) => d.id);
+  cachedAdminUidsAt = Date.now();
+  return cachedAdminUids;
+}
+
 // Reutilise requireAuth (verifie le jeton Firebase), puis verifie
-// l'appartenance a ADMIN_UIDS avant de laisser passer.
-function requireAdmin(req, res, next) {
-  requireAuth(req, res, () => {
-    if (!ADMIN_UIDS.includes(req.uid)) {
-      return res.status(403).json({ error: 'Acces reserve aux administrateurs.' });
+// l'appartenance a ADMIN_SEED_UIDS ou a la collection Firestore avant de
+// laisser passer.
+async function requireAdmin(req, res, next) {
+  requireAuth(req, res, async () => {
+    if (ADMIN_SEED_UIDS.includes(req.uid)) return next();
+    try {
+      const dynamicUids = await getDynamicAdminUids();
+      if (dynamicUids.includes(req.uid)) return next();
+    } catch (err) {
+      console.error('requireAdmin dynamic lookup error:', err.message);
     }
-    next();
+    return res.status(403).json({ error: 'Acces reserve aux administrateurs.' });
   });
 }
 
@@ -548,7 +572,86 @@ app.post('/api/tontine/payout', requireAuth, async (_req, res) => {
 //    proteges par requireAdmin.
 // ---------------------------------------------------------------------------
 app.get('/api/admin/me', requireAdmin, (req, res) => {
-  res.json({ uid: req.uid, isAdmin: true });
+  res.json({ uid: req.uid, isAdmin: true, isSeedAdmin: ADMIN_SEED_UIDS.includes(req.uid) });
+});
+
+// Gestion des admins depuis le dashboard lui-meme. Les admins "amorce"
+// (ADMIN_SEED_UIDS, variable d'environnement) apparaissent avec isSeed=true
+// et ne peuvent pas etre supprimes ici — garde-fou contre un verrouillage
+// total si la collection Firestore est videe par erreur.
+app.get('/api/admin/admins', requireAdmin, async (req, res) => {
+  try {
+    const [seedUsers, dynamicSnap] = await Promise.all([
+      Promise.all(
+        ADMIN_SEED_UIDS.map(async (uid) => {
+          try {
+            const user = await admin.auth().getUser(uid);
+            return { uid, email: user.email || null, isSeed: true };
+          } catch {
+            return { uid, email: null, isSeed: true };
+          }
+        })
+      ),
+      db.collection('adminUsers').get(),
+    ]);
+
+    const dynamicAdmins = dynamicSnap.docs.map((d) => ({
+      uid: d.id,
+      email: d.data().email || null,
+      addedBy: d.data().addedBy || null,
+      addedAt: d.data().addedAt ? d.data().addedAt.toDate().toISOString() : null,
+      isSeed: false,
+    }));
+
+    res.json({ admins: [...seedUsers, ...dynamicAdmins] });
+  } catch (err) {
+    console.error('admin admins list error:', err.message);
+    res.status(500).json({ error: 'Erreur serveur lors de la liste des administrateurs.' });
+  }
+});
+
+app.post('/api/admin/admins', requireAdmin, async (req, res) => {
+  try {
+    const email = (req.body.email || '').trim();
+    if (!email) return res.status(400).json({ error: 'Email requis.' });
+
+    let user;
+    try {
+      user = await admin.auth().getUserByEmail(email);
+    } catch {
+      return res.status(404).json({ error: 'Aucun compte SmartFinance avec cet email.' });
+    }
+
+    await db.collection('adminUsers').doc(user.uid).set({
+      email: user.email,
+      addedBy: req.uid,
+      addedAt: admin.firestore.Timestamp.now(),
+    });
+    cachedAdminUidsAt = 0; // force une relecture au prochain appel, pas d'attente du TTL
+
+    res.json({ ok: true, uid: user.uid, email: user.email });
+  } catch (err) {
+    console.error('admin add admin error:', err.message);
+    res.status(500).json({ error: "Erreur serveur lors de l'ajout de l'administrateur." });
+  }
+});
+
+app.delete('/api/admin/admins/:uid', requireAdmin, async (req, res) => {
+  try {
+    const { uid } = req.params;
+    if (ADMIN_SEED_UIDS.includes(uid)) {
+      return res.status(400).json({
+        error: "Cet administrateur est defini par la variable d'environnement ADMIN_UIDS sur " +
+          "Render, pas modifiable depuis le dashboard.",
+      });
+    }
+    await db.collection('adminUsers').doc(uid).delete();
+    cachedAdminUidsAt = 0;
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('admin remove admin error:', err.message);
+    res.status(500).json({ error: "Erreur serveur lors de la suppression de l'administrateur." });
+  }
 });
 
 // Liste paginee des utilisateurs. Firestore n'offre pas de recherche plein
