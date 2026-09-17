@@ -14,9 +14,15 @@
 //     USSD sur le telephone du payeur, qui valide depuis son propre menu
 //     operateur. On n'a plus qu'a attendre la confirmation (webhook + geste
 //     verifie via l'endpoint d'enquete GET).
-//   - Carte bancaire (CyberSource "Unified Checkout") : necessite d'heberger
-//     le SDK JS CyberSource sur une page web et de gerer un "capture
-//     context" — hors scope ici, pas implemente (mobile money uniquement).
+//   - Carte bancaire (CyberSource "Unified Checkout") : ce serveur heberge
+//     une page HTML (`GET /card-checkout.html`) qui charge le SDK JS
+//     CyberSource et gere le "capture context" — voir la section dediee
+//     plus bas. ATTENTION : les noms de champs des appels E-Billing
+//     `createCardCaptureContext`/`processCardPayment` n'ont PAS pu etre
+//     verifies contre la documentation reelle (Swagger/PDF derriere
+//     l'authentification du portail marchand) au moment de l'ecriture —
+//     a valider en mode lab avant toute mise en production, voir les
+//     commentaires "A VERIFIER" sur ces deux fonctions.
 //
 // Pourquoi un serveur separe : le client_secret E-Billing ne doit jamais
 // vivre dans l'app Flutter. Firebase Cloud Functions aurait ete l'endroit
@@ -279,6 +285,125 @@ function verifyWebhookSignature(req) {
 }
 
 // ---------------------------------------------------------------------------
+// Carte bancaire (CyberSource "Unified Checkout") — memes garde-fous que le
+// mobile money (participant verifie, montant recalcule cote serveur), mais
+// flux SYNCHRONE : la confirmation arrive en reponse directe du second appel,
+// pas par webhook (voir /api/tontine/card/confirm-payment plus bas).
+//
+// A VERIFIER avant mise en production : les chemins et noms de champs
+// ci-dessous suivent la convention deja utilisee ailleurs dans ce fichier
+// (/api/v1/merchant/..., voir createInvoice) et le vocabulaire standard
+// CyberSource (capture_context, client_library, transient_token), mais
+// n'ont PAS ete confirmes contre le Swagger/PDF reel du compte marchand
+// (portail authentifie, non accessible pendant l'ecriture de ce fichier).
+// Teste d'abord en mode lab : une erreur 404 signale un mauvais chemin, une
+// erreur 400 avec un corps de reponse signale generalement les noms de
+// champs attendus (voir logAxiosError dans les logs serveur).
+// ---------------------------------------------------------------------------
+
+async function createCardCaptureContext({ amount, externalReference, targetOrigin }) {
+  const res = await ebillingRequest('post', '/api/v1/merchant/capture_contexts', {
+    data: {
+      amount,
+      currency: 'XAF',
+      client_transaction_id: externalReference,
+      target_origins: [targetOrigin],
+    },
+  });
+  const captureContext = res.data?.capture_context;
+  const clientLibrary = res.data?.client_library;
+  const clientLibraryIntegrity = res.data?.client_library_integrity;
+  if (!captureContext || !clientLibrary) {
+    throw new Error('Reponse E-Billing invalide (capture_context/client_library manquant).');
+  }
+  return { captureContext, clientLibrary, clientLibraryIntegrity };
+}
+
+async function processCardPayment({ transientToken, amount, externalReference, payerName }) {
+  const res = await ebillingRequest('post', '/api/v1/merchant/card_payments', {
+    data: {
+      transient_token: transientToken,
+      amount,
+      currency: 'XAF',
+      client_transaction_id: externalReference,
+      payer_name: payerName,
+    },
+  });
+  const status = res.data?.status;
+  if (status !== 'AUTHORIZED' && status !== 'succeeded' && status !== 'paid') {
+    throw new Error(res.data?.message || 'Paiement carte refuse par le prestataire.');
+  }
+  return res.data;
+}
+
+// Page hebergee par CE serveur (pas par l'app) que la WebView Flutter
+// charge — isole le SDK JS CyberSource du code de l'app, comme l'exige le
+// modele "capture context" (voir tontine_card_payment_screen.dart). Le
+// jeton final est renvoye a Flutter via le JavaScriptChannel
+// `CardPaymentChannel`, jamais les donnees de carte elles-memes.
+//
+// A VERIFIER : le nom exact de la fonction d'initialisation CyberSource
+// (`Cybersource.createUnifiedCheckout` ci-dessous est le nom documente
+// publiquement par CyberSource pour Unified Checkout, mais peut differer
+// selon la version du SDK que renvoie `client_library`) et le nom du champ
+// contenant le jeton dans la reponse du callback (`data.token` suppose).
+const CARD_CHECKOUT_HTML = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { margin: 0; padding: 16px; font-family: sans-serif; background: #ffffff; }
+  #checkout-container { min-height: 300px; }
+  #status { color: #B00020; font-size: 14px; margin-top: 12px; }
+</style>
+</head>
+<body>
+  <div id="checkout-container"></div>
+  <div id="status"></div>
+  <script>
+    function reportError(message) {
+      document.getElementById('status').innerText = message;
+      if (window.CardPaymentChannel) {
+        window.CardPaymentChannel.postMessage('ERROR:' + message);
+      }
+    }
+
+    // Appele par la WebView Flutter une fois la page chargee, avec les
+    // valeurs recues de POST /api/tontine/card/capture-context.
+    window.startCheckout = function (clientLibraryUrl, captureContext) {
+      var script = document.createElement('script');
+      script.src = clientLibraryUrl;
+      script.onload = function () {
+        try {
+          Cybersource.createUnifiedCheckout(captureContext, {
+            containerId: 'checkout-container',
+            onSuccess: function (data) {
+              var token = data && (data.token || data.transientToken);
+              if (!token) {
+                reportError('Jeton de paiement manquant dans la reponse CyberSource.');
+                return;
+              }
+              window.CardPaymentChannel.postMessage(token);
+            },
+            onError: function (err) {
+              reportError((err && err.message) || 'Le paiement par carte a echoue.');
+            },
+          });
+        } catch (e) {
+          reportError('Impossible d\\'initialiser le formulaire de paiement : ' + e.message);
+        }
+      };
+      script.onerror = function () {
+        reportError('Impossible de charger le module de paiement securise.');
+      };
+      document.head.appendChild(script);
+    };
+  </script>
+</body>
+</html>`;
+
+// ---------------------------------------------------------------------------
 // 1) Tontines — initier un paiement : l'app appelle cette route quand le
 //    participant a choisi son operateur et tape "Payer en ligne". Le montant
 //    vient de la tontine cote SERVEUR (jamais du client). Cree la facture ET
@@ -410,6 +535,128 @@ app.post('/api/tontine/ebilling/notify', async (req, res) => {
     // est trace dans les logs pour investigation manuelle.
     res.sendStatus(200);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 2bis) Tontines — paiement par carte : etape 1, obtenir un capture context.
+//    L'app appelle cette route quand le participant choisit "Carte
+//    bancaire". Memes garde-fous que init-payment (tontine existe,
+//    participant membre, montant recalcule cote serveur).
+// ---------------------------------------------------------------------------
+app.post('/api/tontine/card/capture-context', requireAuth, async (req, res) => {
+  try {
+    const { tontineId, roundIndex } = req.body;
+    const uid = req.uid;
+    if (!tontineId || roundIndex === undefined) {
+      return res.status(400).json({ error: 'Parametres manquants.' });
+    }
+
+    const tontineSnap = await db.collection('tontines').doc(tontineId).get();
+    if (!tontineSnap.exists) {
+      return res.status(404).json({ error: 'Tontine introuvable.' });
+    }
+    const tontine = tontineSnap.data();
+    if (!Array.isArray(tontine.participantUids) || !tontine.participantUids.includes(uid)) {
+      return res.status(403).json({ error: "Cet utilisateur ne fait pas partie de cette tontine." });
+    }
+
+    const amount = Math.round(Number(tontine.contributionAmount));
+    const externalReference = `tc${sanitizeForTransactionId(tontineId)}r${roundIndex}${sanitizeForTransactionId(
+      uid
+    )}${Date.now()}`;
+
+    const { captureContext, clientLibrary, clientLibraryIntegrity } = await createCardCaptureContext({
+      amount,
+      externalReference,
+      targetOrigin: PUBLIC_BACKEND_URL,
+    });
+
+    await db.collection('pendingOnlinePayments').doc(externalReference).set({
+      tontineId,
+      uid,
+      roundIndex: Number(roundIndex),
+      amount,
+      method: 'card',
+      createdAt: admin.firestore.Timestamp.now(),
+    });
+
+    res.json({ transactionId: externalReference, captureContext, clientLibrary, clientLibraryIntegrity });
+  } catch (err) {
+    logAxiosError('card/capture-context error:', err);
+    res.status(500).json({ error: "Impossible d'initialiser le paiement par carte." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 2ter) Tontines — paiement par carte : etape 2, finaliser avec le jeton
+//    recu de la WebView (jamais de donnees de carte). Confirmation
+//    SYNCHRONE (contrairement au push USSD) : on ecrit la cotisation
+//    directement dans cette reponse, pas via un webhook separe.
+// ---------------------------------------------------------------------------
+app.post('/api/tontine/card/confirm-payment', requireAuth, async (req, res) => {
+  try {
+    const { transactionId, token, payerName } = req.body;
+    const uid = req.uid;
+    if (!transactionId || !token) {
+      return res.status(400).json({ error: 'Parametres manquants.' });
+    }
+
+    const pendingRef = db.collection('pendingOnlinePayments').doc(transactionId);
+    const pendingSnap = await pendingRef.get();
+    if (!pendingSnap.exists) {
+      return res.status(404).json({ error: 'Paiement introuvable ou deja traite.' });
+    }
+    const pending = pendingSnap.data();
+    if (pending.uid !== uid) {
+      return res.status(403).json({ error: "Ce paiement ne t'appartient pas." });
+    }
+
+    await processCardPayment({
+      transientToken: token,
+      amount: pending.amount,
+      externalReference: transactionId,
+      payerName: payerName || 'Participant',
+    });
+
+    const tontineRef = db.collection('tontines').doc(pending.tontineId);
+
+    // Idempotence : si l'app rejoue l'appel (retry reseau), ne pas creer
+    // deux cotisations pour le meme paiement.
+    const existing = await tontineRef
+      .collection('contributions')
+      .where('onlineTransactionId', '==', transactionId)
+      .limit(1)
+      .get();
+    if (!existing.empty) {
+      await pendingRef.delete();
+      return res.json({ status: 'confirmed' });
+    }
+
+    await tontineRef.collection('contributions').add({
+      uid: pending.uid,
+      roundIndex: pending.roundIndex,
+      amount: pending.amount,
+      date: admin.firestore.Timestamp.now(),
+      proofImageBase64: '',
+      status: 'verified', // paiement confirme par E-Billing/CyberSource, pas besoin de verification humaine
+      verifiedBy: 'ebilling',
+      verifiedAt: admin.firestore.Timestamp.now(),
+      transactionLogged: false,
+      paymentMethod: 'online',
+      onlineTransactionId: transactionId,
+    });
+
+    await pendingRef.delete();
+    res.json({ status: 'confirmed' });
+  } catch (err) {
+    logAxiosError('card/confirm-payment error:', err);
+    res.status(402).json({ error: err.message || 'Le paiement par carte a echoue.' });
+  }
+});
+
+// Page hebergee servie a la WebView Flutter — voir CARD_CHECKOUT_HTML plus haut.
+app.get('/card-checkout.html', (_req, res) => {
+  res.type('html').send(CARD_CHECKOUT_HTML);
 });
 
 // ---------------------------------------------------------------------------
