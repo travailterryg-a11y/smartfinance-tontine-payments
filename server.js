@@ -57,6 +57,7 @@ const cors = require('cors');
 const axios = require('axios');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
+const rateLimit = require('express-rate-limit');
 
 const {
   PORT = 3000,
@@ -93,6 +94,20 @@ const db = admin.firestore();
 
 const app = express();
 app.use(cors());
+
+// Limite les tentatives de paiement par IP — un compte compromis/malveillant
+// ne peut plus spammer des push USSD (vers un numero arbitraire, voir
+// requireAuth plus bas) ni multiplier les appels facturables aupres
+// d'E-Billing. Par IP plutot que par uid : plus simple, et un uid legitime
+// derriere un NAT partage reste tres au-dessus de cette limite en usage
+// normal (quelques paiements par tontine et par mois).
+const paymentInitLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Trop de tentatives de paiement. Reessaie dans quelques minutes.' },
+});
 // `verify` capture le corps brut (avant parsing) pour la verification de
 // signature HMAC des webhooks, qui porte sur le corps exact tel qu'envoye.
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); } }));
@@ -409,7 +424,7 @@ const CARD_CHECKOUT_HTML = `<!DOCTYPE html>
 //    vient de la tontine cote SERVEUR (jamais du client). Cree la facture ET
 //    declenche immediatement le push USSD (deux appels E-Billing).
 // ---------------------------------------------------------------------------
-app.post('/api/tontine/init-payment', requireAuth, async (req, res) => {
+app.post('/api/tontine/init-payment', paymentInitLimiter, requireAuth, async (req, res) => {
   try {
     const { tontineId, roundIndex, payerName, payerPhone, operator } = req.body;
     const uid = req.uid;
@@ -425,8 +440,20 @@ app.post('/api/tontine/init-payment', requireAuth, async (req, res) => {
     if (!Array.isArray(tontine.participantUids) || !tontine.participantUids.includes(uid)) {
       return res.status(403).json({ error: "Cet utilisateur ne fait pas partie de cette tontine." });
     }
+    // Sans ce controle, un client pouvait envoyer n'importe quel roundIndex
+    // (passe ou futur) : la cotisation aurait ete creee pour un tour qui
+    // n'est plus (ou pas encore) celui en cours, corrompant le calcul de
+    // "tour complet" cote client (TontineRotationCalculator.isRoundComplete).
+    if (Number(roundIndex) !== tontine.currentRoundIndex) {
+      return res.status(409).json({
+        error: "Ce tour n'est plus le tour en cours. Retourne a l'ecran precedent et reessaie.",
+      });
+    }
 
     const amount = Math.round(Number(tontine.contributionAmount));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(500).json({ error: 'Montant de cotisation invalide pour cette tontine.' });
+    }
     const externalReference = `tt${sanitizeForTransactionId(tontineId)}r${roundIndex}${sanitizeForTransactionId(
       uid
     )}${Date.now()}`;
@@ -445,6 +472,7 @@ app.post('/api/tontine/init-payment', requireAuth, async (req, res) => {
       uid,
       roundIndex: Number(roundIndex),
       amount,
+      method: 'mobile_money',
       billId,
       ussdPushId: String(ussdPush.id),
       createdAt: admin.firestore.Timestamp.now(),
@@ -500,31 +528,30 @@ app.post('/api/tontine/ebilling/notify', async (req, res) => {
 
     const tontineRef = db.collection('tontines').doc(pending.tontineId);
 
-    // Idempotence : si le webhook est livre plusieurs fois, ne pas creer
-    // deux cotisations pour le meme paiement.
-    const existing = await tontineRef
-      .collection('contributions')
-      .where('onlineTransactionId', '==', externalReference)
-      .limit(1)
-      .get();
-    if (!existing.empty) {
-      await pendingRef.delete();
-      return res.sendStatus(200);
+    // Idempotence ATOMIQUE : E-Billing peut livrer ce webhook plusieurs fois
+    // (retry sur timeout). Un `get()` suivi d'un `add()` laissait une
+    // fenetre de course ou deux livraisons quasi simultanees passaient
+    // toutes les deux le test `existing.empty` avant que l'une ou l'autre
+    // n'ait ecrit — deux cotisations "verified" pour un seul paiement reel.
+    // `doc(id).create()` est atomique cote Firestore : le second appel avec
+    // le meme id echoue avec ALREADY_EXISTS, jamais de doublon possible.
+    try {
+      await tontineRef.collection('contributions').doc(externalReference).create({
+        uid: pending.uid,
+        roundIndex: pending.roundIndex,
+        amount: pending.amount,
+        date: admin.firestore.Timestamp.now(),
+        proofImageBase64: '',
+        status: 'verified', // paiement confirme par E-Billing lui-meme, pas besoin de verification humaine
+        verifiedBy: 'ebilling',
+        verifiedAt: admin.firestore.Timestamp.now(),
+        transactionLogged: false,
+        paymentMethod: 'online',
+        onlineTransactionId: externalReference,
+      });
+    } catch (createErr) {
+      if (createErr.code !== 6 /* ALREADY_EXISTS */) throw createErr;
     }
-
-    await tontineRef.collection('contributions').add({
-      uid: pending.uid,
-      roundIndex: pending.roundIndex,
-      amount: pending.amount,
-      date: admin.firestore.Timestamp.now(),
-      proofImageBase64: '',
-      status: 'verified', // paiement confirme par E-Billing lui-meme, pas besoin de verification humaine
-      verifiedBy: 'ebilling',
-      verifiedAt: admin.firestore.Timestamp.now(),
-      transactionLogged: false,
-      paymentMethod: 'online',
-      onlineTransactionId: externalReference,
-    });
 
     await pendingRef.delete();
     res.sendStatus(200);
@@ -543,7 +570,7 @@ app.post('/api/tontine/ebilling/notify', async (req, res) => {
 //    bancaire". Memes garde-fous que init-payment (tontine existe,
 //    participant membre, montant recalcule cote serveur).
 // ---------------------------------------------------------------------------
-app.post('/api/tontine/card/capture-context', requireAuth, async (req, res) => {
+app.post('/api/tontine/card/capture-context', paymentInitLimiter, requireAuth, async (req, res) => {
   try {
     const { tontineId, roundIndex } = req.body;
     const uid = req.uid;
@@ -559,8 +586,16 @@ app.post('/api/tontine/card/capture-context', requireAuth, async (req, res) => {
     if (!Array.isArray(tontine.participantUids) || !tontine.participantUids.includes(uid)) {
       return res.status(403).json({ error: "Cet utilisateur ne fait pas partie de cette tontine." });
     }
+    if (Number(roundIndex) !== tontine.currentRoundIndex) {
+      return res.status(409).json({
+        error: "Ce tour n'est plus le tour en cours. Retourne a l'ecran precedent et reessaie.",
+      });
+    }
 
     const amount = Math.round(Number(tontine.contributionAmount));
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(500).json({ error: 'Montant de cotisation invalide pour cette tontine.' });
+    }
     const externalReference = `tc${sanitizeForTransactionId(tontineId)}r${roundIndex}${sanitizeForTransactionId(
       uid
     )}${Date.now()}`;
@@ -593,7 +628,7 @@ app.post('/api/tontine/card/capture-context', requireAuth, async (req, res) => {
 //    SYNCHRONE (contrairement au push USSD) : on ecrit la cotisation
 //    directement dans cette reponse, pas via un webhook separe.
 // ---------------------------------------------------------------------------
-app.post('/api/tontine/card/confirm-payment', requireAuth, async (req, res) => {
+app.post('/api/tontine/card/confirm-payment', paymentInitLimiter, requireAuth, async (req, res) => {
   try {
     const { transactionId, token, payerName } = req.body;
     const uid = req.uid;
@@ -610,6 +645,12 @@ app.post('/api/tontine/card/confirm-payment', requireAuth, async (req, res) => {
     if (pending.uid !== uid) {
       return res.status(403).json({ error: "Ce paiement ne t'appartient pas." });
     }
+    // Un transactionId issu du flux mobile money (init-payment) ne doit
+    // jamais pouvoir etre soumis ici avec un jeton carte — les deux flux
+    // sont distincts des la creation du pendingOnlinePayments.
+    if (pending.method !== 'card') {
+      return res.status(400).json({ error: 'Ce paiement ne correspond pas a un paiement par carte.' });
+    }
 
     await processCardPayment({
       transientToken: token,
@@ -620,31 +661,26 @@ app.post('/api/tontine/card/confirm-payment', requireAuth, async (req, res) => {
 
     const tontineRef = db.collection('tontines').doc(pending.tontineId);
 
-    // Idempotence : si l'app rejoue l'appel (retry reseau), ne pas creer
-    // deux cotisations pour le meme paiement.
-    const existing = await tontineRef
-      .collection('contributions')
-      .where('onlineTransactionId', '==', transactionId)
-      .limit(1)
-      .get();
-    if (!existing.empty) {
-      await pendingRef.delete();
-      return res.json({ status: 'confirmed' });
+    // Idempotence ATOMIQUE (voir le meme correctif sur le webhook mobile
+    // money plus haut) : un retry reseau cote app ne peut plus creer deux
+    // cotisations pour le meme paiement carte.
+    try {
+      await tontineRef.collection('contributions').doc(transactionId).create({
+        uid: pending.uid,
+        roundIndex: pending.roundIndex,
+        amount: pending.amount,
+        date: admin.firestore.Timestamp.now(),
+        proofImageBase64: '',
+        status: 'verified', // paiement confirme par E-Billing/CyberSource, pas besoin de verification humaine
+        verifiedBy: 'ebilling',
+        verifiedAt: admin.firestore.Timestamp.now(),
+        transactionLogged: false,
+        paymentMethod: 'online',
+        onlineTransactionId: transactionId,
+      });
+    } catch (createErr) {
+      if (createErr.code !== 6 /* ALREADY_EXISTS */) throw createErr;
     }
-
-    await tontineRef.collection('contributions').add({
-      uid: pending.uid,
-      roundIndex: pending.roundIndex,
-      amount: pending.amount,
-      date: admin.firestore.Timestamp.now(),
-      proofImageBase64: '',
-      status: 'verified', // paiement confirme par E-Billing/CyberSource, pas besoin de verification humaine
-      verifiedBy: 'ebilling',
-      verifiedAt: admin.firestore.Timestamp.now(),
-      transactionLogged: false,
-      paymentMethod: 'online',
-      onlineTransactionId: transactionId,
-    });
 
     await pendingRef.delete();
     res.json({ status: 'confirmed' });
