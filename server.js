@@ -58,6 +58,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const admin = require('firebase-admin');
 const rateLimit = require('express-rate-limit');
+const cron = require('node-cron');
 
 const {
   PORT = 3000,
@@ -69,6 +70,15 @@ const {
   EBILLING_WEBHOOK_SIGNING_KEY,
   PUBLIC_BACKEND_URL,
   FIREBASE_SERVICE_ACCOUNT,
+  // Secret partage avec le ping externe (cron-job.org ou equivalent) qui
+  // appelle POST /api/scheduler/run-payouts — voir section "Reversement
+  // automatique" plus bas. Sans cette variable, cette route refuse tout le
+  // monde (403).
+  SCHEDULER_SECRET,
+  // Reste absent/false tant que le scope Payout SHAP n'a pas ete confirme
+  // par Digitech Africa (voir section "Reversement automatique") — ne pas
+  // activer sans avoir la vraie spec en main.
+  SHAP_PAYOUT_ENABLED,
 } = process.env;
 
 if (!EBILLING_CLIENT_ID || !EBILLING_CLIENT_SECRET || !PUBLIC_BACKEND_URL || !FIREBASE_SERVICE_ACCOUNT) {
@@ -827,24 +837,205 @@ app.post('/api/premium/ebilling/notify', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// 4) Reversement au beneficiaire du tour (PAYOUT) — NON IMPLEMENTE.
+// 4) Reversement automatique au beneficiaire du tour ("jour J") — la spec
+//    obtenue declare les tags SHAP "Payouts"/"Cash-in"/"KYC"/"Account" mais
+//    ne liste aucun chemin pour eux (scopes probablement non encore
+//    accordes a ce compte marchand). Impossible d'integrer le VRAI appel de
+//    decaissement honnetement sans deviner des noms d'endpoint.
 //
-//    La spec obtenue declare les tags "Payouts"/"Cash-in"/"KYC"/"Account"
-//    mais ne liste aucun chemin pour eux — probablement des scopes non
-//    encore accordes a ce compte marchand. Impossible a integrer
-//    honnetement sans deviner des noms d'endpoint. En attendant, le systeme
-//    existant reste disponible en parallele : chaque beneficiaire renseigne
-//    ses coordonnees de reception dans l'app, et les autres participants
-//    paient manuellement puis televersent une preuve (bouton "J'ai payé"),
-//    verifiee par un humain.
+//    Decision : construire tout le systeme d'orchestration (planification
+//    par date, calcul du montant partiel, notifications, tracabilite,
+//    repli manuel) des maintenant, et poser le SEUL appel reseau reel
+//    (`disburseShapPayout`) derriere un interrupteur (`SHAP_PAYOUT_ENABLED`,
+//    absent par defaut) qui court-circuite proprement vers le repli manuel
+//    tant que la vraie spec SHAP n'est pas obtenue aupres de Digitech
+//    Africa — coherent avec le KYC Payout "pas encore fait" cote compte
+//    marchand. Le jour ou la spec arrive, seul le corps de cette fonction
+//    change.
+//
+//    Fiabilite du declenchement horaire malgre la mise en veille du plan
+//    gratuit Render : job interne (node-cron, ci-dessous) + route protegee
+//    `POST /api/scheduler/run-payouts` appelee par un ping externe gratuit
+//    (cron-job.org ou equivalent) toutes les heures, qui reveille le
+//    serveur au passage.
 // ---------------------------------------------------------------------------
-app.post('/api/tontine/payout', requireAuth, async (_req, res) => {
-  res.status(501).json({
-    error:
-      "Le reversement automatique n'est pas implemente. La documentation E-Billing pour les " +
-      "endpoints Payout n'apparait pas encore sur ce compte marchand — recontacte Digitech " +
-      "Africa pour faire activer ce scope, puis reviens completer cette route avec la vraie spec.",
+
+async function disburseShapPayout({ amount, recipientPaymentInfo, externalReference }) {
+  if (SHAP_PAYOUT_ENABLED !== 'true') {
+    return { success: false, reason: 'not_configured' };
+  }
+  // Volontairement pas d'implementation reelle : ce chemin ne s'execute
+  // jamais avec la config actuelle (SHAP_PAYOUT_ENABLED absent/!= 'true').
+  // A completer avec le vrai appel ebillingRequest(...) vers les endpoints
+  // SHAP une fois leur spec (chemins, noms de champs) obtenue.
+  throw new Error(
+    "SHAP_PAYOUT_ENABLED est active mais disburseShapPayout() n'a pas encore d'implementation " +
+      "reelle — complete cette fonction avec la vraie spec SHAP avant de l'activer."
+  );
+}
+
+// Reconstitue `nextPayoutDate` pour les tontines creees avant ce champ, a
+// partir de `createdAt` + frequence — sans cela, une requete sur
+// `nextPayoutDate <= now` ignore silencieusement tout document ou le champ
+// est absent (semantique Firestore : un filtre d'egalite/inegalite ne
+// matche jamais un champ manquant).
+async function backfillMissingNextPayoutDates() {
+  const snap = await db.collection('tontines').where('deleted', '==', false).get();
+  const now = Date.now();
+  for (const doc of snap.docs) {
+    const tontine = doc.data();
+    if (tontine.nextPayoutDate) continue;
+    const createdAtMs = tontine.createdAt ? tontine.createdAt.toMillis() : now;
+    const intervalDays = tontine.frequency === 'weekly' ? 7 : 30;
+    const nextPayoutDate = admin.firestore.Timestamp.fromMillis(createdAtMs + intervalDays * 24 * 60 * 60 * 1000);
+    await doc.ref.update({ nextPayoutDate });
+  }
+}
+
+// Fait avancer le tour ET recalcule `nextPayoutDate` dans une transaction qui
+// revérifie l'échéance — empêche un double traitement si le job interne et
+// le ping externe se chevauchent sur la même tontine.
+async function advanceDueTontineRound(tontineId) {
+  const tontineRef = db.collection('tontines').doc(tontineId);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(tontineRef);
+    if (!snap.exists) return null;
+    const tontine = snap.data();
+    const now = admin.firestore.Timestamp.now();
+    if (!tontine.nextPayoutDate || tontine.nextPayoutDate.toMillis() > now.toMillis()) {
+      return null; // deja traite entretemps par un appel concurrent
+    }
+    const rotationOrder = Array.isArray(tontine.rotationOrder) ? tontine.rotationOrder : [];
+    if (rotationOrder.length === 0) return null;
+
+    const roundIndex = Number(tontine.currentRoundIndex) || 0;
+    const recipientUid = rotationOrder[roundIndex % rotationOrder.length];
+    const nextIndex = (roundIndex + 1) % rotationOrder.length;
+    const intervalDays = tontine.frequency === 'weekly' ? 7 : 30;
+    const nextPayoutDate = admin.firestore.Timestamp.fromMillis(now.toMillis() + intervalDays * 24 * 60 * 60 * 1000);
+
+    tx.update(tontineRef, { currentRoundIndex: nextIndex, nextPayoutDate });
+
+    return {
+      roundIndex,
+      recipientUid,
+      dueDate: tontine.nextPayoutDate,
+      contributionAmount: Number(tontine.contributionAmount) || 0,
+      participantUids: Array.isArray(tontine.participantUids) ? tontine.participantUids : [],
+      recipientPaymentInfo: (tontine.participantPaymentInfo || {})[recipientUid] || null,
+    };
   });
+}
+
+async function processTontinePayout(tontineId) {
+  const advanceResult = await advanceDueTontineRound(tontineId);
+  if (!advanceResult) return;
+
+  const { roundIndex, recipientUid, dueDate, contributionAmount, participantUids, recipientPaymentInfo } =
+    advanceResult;
+  const tontineRef = db.collection('tontines').doc(tontineId);
+
+  const contribSnap = await tontineRef.collection('contributions').where('roundIndex', '==', roundIndex).get();
+  const verifiedUids = new Set();
+  const onlinePaidUids = new Set();
+  contribSnap.forEach((doc) => {
+    const c = doc.data();
+    if (c.status === 'verified') {
+      verifiedUids.add(c.uid);
+      if (c.paymentMethod === 'online') onlinePaidUids.add(c.uid);
+    }
+  });
+  // Non-payeurs = aucune cotisation verifiee du tout (en ligne OU preuve
+  // manuelle) — quelqu'un ayant paye manuellement n'est pas un retardataire,
+  // meme si sa part n'est pas dans le montant decaisse automatiquement.
+  const unpaidUids = participantUids.filter((uid) => !verifiedUids.has(uid));
+  const amountSent = onlinePaidUids.size * contributionAmount;
+
+  let status;
+  let shapTransactionId = null;
+  if (onlinePaidUids.size === 0) {
+    status = 'no_online_contributions';
+  } else {
+    try {
+      const disbursement = await disburseShapPayout({
+        amount: amountSent,
+        recipientPaymentInfo,
+        externalReference: `payout${sanitizeForTransactionId(tontineId)}r${roundIndex}`,
+      });
+      if (disbursement.success) {
+        shapTransactionId = disbursement.transactionId || null;
+        status = onlinePaidUids.size === participantUids.length ? 'sent' : 'partial_sent';
+      } else {
+        status = 'failed_fallback_manual';
+      }
+    } catch (err) {
+      logAxiosError(`disburseShapPayout (${tontineId} round ${roundIndex}) error:`, err);
+      status = 'failed_fallback_manual';
+    }
+  }
+
+  // Idempotence : id deterministe par tour, meme patron que les webhooks de
+  // paiement plus haut — un appel concurrent qui arriverait quand meme
+  // jusqu'ici (fenetre entre la transaction et cette ecriture) echoue
+  // silencieusement au lieu de dupliquer l'evenement.
+  try {
+    await tontineRef.collection('payoutEvents').doc(`round-${roundIndex}`).create({
+      roundIndex,
+      recipientUid,
+      dueDate,
+      contributionAmount,
+      participantCount: participantUids.length,
+      onlinePaidUids: Array.from(onlinePaidUids),
+      unpaidUids,
+      amountSent,
+      status,
+      shapTransactionId,
+      createdAt: admin.firestore.Timestamp.now(),
+    });
+  } catch (createErr) {
+    if (createErr.code !== 6 /* ALREADY_EXISTS */) throw createErr;
+  }
+}
+
+async function checkAndProcessDuePayouts() {
+  await backfillMissingNextPayoutDates();
+
+  const now = admin.firestore.Timestamp.now();
+  const dueSnap = await db
+    .collection('tontines')
+    .where('nextPayoutDate', '<=', now)
+    .where('deleted', '==', false)
+    .get();
+
+  for (const doc of dueSnap.docs) {
+    try {
+      await processTontinePayout(doc.id);
+    } catch (err) {
+      logAxiosError(`checkAndProcessDuePayouts (${doc.id}) error:`, err);
+    }
+  }
+}
+
+// Route appelee par le ping externe (voir README) — le job interne
+// ci-dessous ne se declenche que si le serveur est deja eveille, cette route
+// garantit le declenchement a l'heure pres et reveille le serveur au passage.
+app.post('/api/scheduler/run-payouts', async (req, res) => {
+  if (!SCHEDULER_SECRET || req.headers['x-scheduler-secret'] !== SCHEDULER_SECRET) {
+    return res.status(403).json({ error: 'Non autorise.' });
+  }
+  try {
+    await checkAndProcessDuePayouts();
+    res.json({ ok: true });
+  } catch (err) {
+    logAxiosError('run-payouts error:', err);
+    res.status(500).json({ error: 'Erreur serveur lors du traitement des versements.' });
+  }
+});
+
+// Filet de securite interne — ne se declenche que si le serveur est deja
+// eveille a l'heure pile (voir avertissement Render plus haut).
+cron.schedule('0 * * * *', () => {
+  checkAndProcessDuePayouts().catch((err) => logAxiosError('cron checkAndProcessDuePayouts error:', err));
 });
 
 // ---------------------------------------------------------------------------

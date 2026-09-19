@@ -20,9 +20,10 @@ integrations les plus anciennes en ligne :
   E-Billing envoie directement une invite de paiement sur le telephone du
   payeur, qui valide depuis son propre menu operateur (Airtel Money / Moov
   Money). L'app attend juste la confirmation via Firestore.
-- **Carte bancaire** (CyberSource "Unified Checkout") : necessite d'heberger
-  le SDK JS CyberSource sur une page web — **non implemente ici**, mobile
-  money uniquement pour l'instant.
+- **Carte bancaire** (CyberSource "Unified Checkout") : ce serveur heberge
+  une page HTML (`GET /card-checkout.html`) qui charge le SDK JS CyberSource
+  et gere le "capture context" — voir `POST /api/tontine/card/capture-context`
+  et `POST /api/tontine/card/confirm-payment` plus bas.
 
 ## Ce qu'il fait
 
@@ -40,8 +41,17 @@ integrations les plus anciennes en ligne :
    /api/v2/merchant/ussd_push/{id}`) pour confirmer l'etat reel avant
    d'ecrire quoi que ce soit, puis cree la cotisation dans Firestore avec le
    statut `verified`.
-3. **Reversement au beneficiaire** (`POST /api/tontine/payout`) : NON
-   IMPLEMENTE (voir "Hors scope" plus bas).
+3. **Reversement automatique au beneficiaire ("jour J")** : un job planifie
+   (interne + route `POST /api/scheduler/run-payouts` appelable par un ping
+   externe) verifie chaque heure si l'echeance calendaire d'une tontine est
+   atteinte. Si oui, envoie ce qui a ete collecte EN LIGNE ce tour (meme
+   partiel), note qui n'a pas cotise, avance le tour, et enregistre le tout
+   dans `tontines/{id}/payoutEvents/{eventId}`. Le VRAI decaissement (via le
+   scope SHAP d'E-Billing) n'est pas encore implemente (voir "Hors scope"
+   plus bas) — tant qu'il ne l'est pas, chaque declenchement bascule
+   proprement sur le statut `failed_fallback_manual`, et le circuit manuel
+   existant (coordonnees de reception + preuve "J'ai payé") reste la seule
+   facon reelle de transferer l'argent.
 
 ### Abonnement Premium
 
@@ -110,7 +120,20 @@ Note sur le plan gratuit Render : le service se met en veille apres 15 min
 d'inactivite et met quelques secondes a se reveiller au premier appel — sans
 consequence ici puisque l'app attend deja la confirmation via Firestore.
 
-### 4. Test local (optionnel avant de deployer)
+### 4bis. Ping externe pour le reversement automatique "jour J" (recommande)
+Le plan gratuit Render met ce serveur en veille apres 15 min d'inactivite —
+sans ping externe, le job interne (node-cron) qui verifie les echeances de
+tontine chaque heure ne se declenche que si le serveur est deja eveille,
+avec un risque de retard de quelques heures.
+1. Genere un secret aleatoire et mets-le dans `SCHEDULER_SECRET` (sur
+   Render, dans l'onglet "Environment").
+2. Cree un compte gratuit sur https://cron-job.org (ou equivalent).
+3. Configure un job qui appelle, toutes les heures :
+   - URL : `https://<ton-url-render>/api/scheduler/run-payouts`
+   - Methode : `POST`
+   - En-tete : `X-Scheduler-Secret: <la valeur de SCHEDULER_SECRET>`
+
+### 5. Test local (optionnel avant de deployer)
 ```bash
 cd payment_backend
 npm install
@@ -150,15 +173,25 @@ reconfigure temporairement tes URLs de notification dessus le temps du test.
 
 ## Hors scope pour l'instant
 
-- **Paiement par carte** (Visa/Mastercard via CyberSource Unified Checkout) —
-  necessite d'heberger le SDK JS CyberSource sur une page web et de gerer un
-  "capture context" ; architecture differente du push USSD, pas traitee ici.
-- **Reversement automatique aux beneficiaires de tontine (PAYOUT)** — la
-  spec obtenue declare les tags "Payouts"/"Cash-in"/"KYC"/"Account" mais ne
-  liste aucun endpoint pour eux (scopes probablement non accordes a ce
-  compte). `POST /api/tontine/payout` repond une erreur explicite (501)
-  plutot que de deviner des noms d'endpoint. En attendant, le systeme
-  existant reste disponible en parallele : chaque beneficiaire renseigne ses
-  coordonnees de reception dans l'app, et les autres participants peuvent
-  toujours payer manuellement puis televerser une preuve (bouton "J'ai
-  payé"), verifiee par un humain.
+- **Le VRAI decaissement SHAP** — la spec obtenue declare les tags
+  "Payouts"/"Cash-in"/"KYC"/"Account" mais ne liste aucun endpoint pour eux
+  (scopes probablement non accordes a ce compte). `disburseShapPayout()`
+  dans `server.js` est volontairement posee derriere l'interrupteur
+  `SHAP_PAYOUT_ENABLED` (absent par defaut) plutot que de deviner des noms
+  d'endpoint — toute la planification/orchestration autour (echeance
+  calendaire, calcul du montant partiel, notifications, tracabilite) est
+  deja en place et fonctionne des maintenant, avec repli automatique sur le
+  statut `failed_fallback_manual`. Recontacte Digitech Africa pour faire
+  activer ce scope, obtiens la vraie spec, puis complete cette seule
+  fonction. En attendant, le systeme existant reste disponible en
+  parallele : chaque beneficiaire renseigne ses coordonnees de reception
+  dans l'app, et les autres participants peuvent toujours payer
+  manuellement puis televerser une preuve (bouton "J'ai payé"), verifiee
+  par un humain.
+- **Ping externe pour le scheduler** — `POST /api/scheduler/run-payouts`
+  existe et est protege par `SCHEDULER_SECRET`, mais il faut configurer
+  toi-meme un service externe gratuit (ex. cron-job.org) pour l'appeler
+  chaque heure ; voir l'etape 4bis ci-dessus. Sans cette configuration, seul le
+  job interne (node-cron, meme cadence) declenche les versements, avec le
+  risque qu'il soit manque de quelques heures si le serveur Render dormait
+  au moment de l'echeance.
